@@ -38,6 +38,31 @@ except Exception:
     def auto_grade_for_clip(video, start=0.0, duration=None, verbose=False):  # type: ignore
         return "eq=contrast=1.03:saturation=0.98", {}
 
+try:
+    from profanity_filter import (  # same directory
+        build_profanity_matcher,
+        censor_word,
+        is_profane,
+        load_profanity_stems,
+    )
+except Exception:
+    # Same reason as the grade.py fallback above: a caller that loads this
+    # file via importlib.util.spec_from_file_location (every test in tests/
+    # does) doesn't put helpers/ on sys.path, so a plain sibling import 404s.
+    # These stubs are also exactly correct behavior for "no matcher" — a
+    # matcher of None is already a documented no-op in helpers/profanity_filter.py.
+    def load_profanity_stems(path=None):  # type: ignore
+        return []
+
+    def build_profanity_matcher(stems):  # type: ignore
+        return None
+
+    def is_profane(text, matcher):  # type: ignore
+        return False
+
+    def censor_word(text, matcher):  # type: ignore
+        return text
+
 
 # -------- Subtitle style (bold-overlay, proven at 1920×1080 and 1080×1920) --
 #
@@ -85,6 +110,82 @@ def resolve_grade_filter(grade_field: str | None) -> str:
     return grade_field
 
 
+# -------- 3D LUTs (creative look, applied per-segment after grade) ---------
+#
+# A LUT is a separate concern from `grade`: grade is corrective (exposure,
+# contrast, saturation — fix what's wrong), a LUT is a creative "look" baked
+# by a colorist or a camera manufacturer (log-to-Rec.709 conversion, a film
+# emulation). Both can be present on the same segment; grade runs first.
+
+LUT_DIR = Path(__file__).resolve().parent.parent / "lut"
+LUT_EXTENSIONS = (".cube", ".3dl", ".dat", ".m3d", ".csp")
+
+
+def find_lut_file(name: str, edit_dir: Path | None = None) -> Path:
+    """Resolve a LUT by bare name against lut/, or by an explicit path.
+
+    `name` can be:
+      - a bare name ("kodak_2383")            -> lut/kodak_2383.cube (or any
+                                                  other known extension)
+      - a bare name with extension already on -> lut/<name> as given
+      - an absolute or relative path to a LUT file anywhere on disk
+    """
+    p = Path(name)
+    if p.is_absolute() and p.exists():
+        return p
+    if edit_dir is not None:
+        relative = resolve_path(name, edit_dir)
+        if relative.exists():
+            return relative
+    if p.exists():
+        return p.resolve()
+
+    # Don't trust Path.suffix here: a real camera/colorist LUT name routinely
+    # contains its own dots ("...to Rec.709 V1.cube" — the file already in
+    # lut/), so `Path(name).suffix` reads back ".709 V1" for the bare name
+    # and wrongly looks "already extensioned". Check the actual extension set.
+    candidates = [LUT_DIR / name]
+    if not name.lower().endswith(LUT_EXTENSIONS):
+        candidates += [LUT_DIR / f"{name}{ext}" for ext in LUT_EXTENSIONS]
+    for c in candidates:
+        if c.exists():
+            return c
+
+    available = (
+        sorted(f.stem for f in LUT_DIR.glob("*") if f.suffix.lower() in LUT_EXTENSIONS)
+        if LUT_DIR.is_dir() else []
+    )
+    hint = (
+        f" Available in lut/: {', '.join(available)}" if available
+        else f" lut/ is empty — drop a .cube file there (see lut/README.md)."
+    )
+    sys.exit(f"LUT not found: '{name}'.{hint}")
+
+
+def lut_filter_string(lut_path: Path) -> str:
+    """Build the `lut3d=file='...'` filter segment, Windows-path-safe.
+
+    Same escaping as the subtitles filter below: forward slashes (a backslash
+    is an escape character inside a filtergraph, so a native Windows path
+    breaks this the same way it breaks `subtitles=`), then escape the drive
+    colon and any single quotes.
+    """
+    abs_path = (
+        str(lut_path.resolve())
+        .replace("\\", "/")
+        .replace(":", r"\:")
+        .replace("'", r"\'")
+    )
+    return f"lut3d=file='{abs_path}'"
+
+
+def resolve_lut_filter(lut_field: str | None, edit_dir: Path | None = None) -> str:
+    """CLI --lut or the EDL's 'lut' field -> the ffmpeg filter string, or ""."""
+    if not lut_field:
+        return ""
+    return lut_filter_string(find_lut_file(lut_field, edit_dir))
+
+
 def resolve_path(maybe_path: str, base: Path) -> Path:
     """Resolve a path that may be absolute or relative to `base`."""
     p = Path(maybe_path)
@@ -93,17 +194,34 @@ def resolve_path(maybe_path: str, base: Path) -> Path:
     return (base / p).resolve()
 
 
-def resolve_subtitles_path(maybe_path: str, edit_dir: Path) -> Path:
-    """Resolve the EDL's subtitles path: relative to the EDL's directory, else the
-    current directory (agents often write "edit/master.srt"). A missing file is an
-    error: rendering on without it silently ships a video with no captions."""
+def resolve_edl_asset_path(maybe_path: str, edit_dir: Path) -> Path | None:
+    """Resolve a path the EDL references (overlay file, subtitles) that may be
+    written two ways: relative to the EDL's own directory, or relative to the
+    project root with a literal "edit/" prefix — what it looks like from
+    <videos_dir>, which is naturally how an agent writes it (the EDL format
+    example in SKILL.md itself does this: "edit/animations/slot_1/render.mp4").
+    Since `edit_dir` IS already <videos_dir>/edit, resolving that string
+    edit_dir-relative alone would double up to ".../edit/edit/...". Try both,
+    return whichever exists; None if neither does.
+    """
     candidates = [resolve_path(maybe_path, edit_dir)]
     if not Path(maybe_path).is_absolute():
         candidates.append(Path(maybe_path).resolve())
     for c in candidates:
         if c.exists():
             return c
-    tried = ", ".join(str(c) for c in candidates)
+    return None
+
+
+def resolve_subtitles_path(maybe_path: str, edit_dir: Path) -> Path:
+    """Resolve the EDL's subtitles path. A missing file is an error: rendering
+    on without it silently ships a video with no captions."""
+    found = resolve_edl_asset_path(maybe_path, edit_dir)
+    if found is not None:
+        return found
+    tried = ", ".join(
+        str(c) for c in (resolve_path(maybe_path, edit_dir), Path(maybe_path).resolve())
+    )
     sys.exit(f"subtitles file in EDL not found (tried {tried}). Fix the path or pass --no-subtitles.")
 
 
@@ -254,8 +372,9 @@ def extract_segment(
     preview: bool = False,
     draft: bool = False,
     rate: str | None = None,
+    lut_filter: str = "",
 ) -> None:
-    """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
+    """Extract a cut range as its own MP4 with grade + LUT + 30ms audio fades baked in.
 
     `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
     Portrait sources (height > width) are scaled by height to preserve orientation.
@@ -279,6 +398,10 @@ def extract_segment(
     vf_parts.append(scale)
     if grade_filter:
         vf_parts.append(grade_filter)
+    # LUT last: a corrective grade runs first, the creative "look" on top of it —
+    # same order a colorist layers a corrective node under a creative node.
+    if lut_filter:
+        vf_parts.append(lut_filter)
     vf = ",".join(vf_parts)
 
     # 30ms audio fades at both edges (Rule 3) — prevent pops
@@ -320,6 +443,7 @@ def extract_all_segments(
     preview: bool,
     draft: bool = False,
     fps: str | None = None,
+    lut: str | None = None,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -327,9 +451,16 @@ def extract_all_segments(
     If the EDL `grade` is "auto", analyze each segment range with
     `auto_grade_for_clip` and apply a per-segment subtle correction.
     Otherwise, apply the same preset/raw filter to every segment.
+
+    `lut`: CLI --lut value, or None to fall back to the EDL's own "lut" field.
+    A LUT is global to the render (one "look"), unlike grade which can be
+    "auto" per segment — so it's resolved once here, not per-range.
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
+    lut_filter = resolve_lut_filter(lut or edl.get("lut"), edit_dir)
+    if lut_filter:
+        print(f"  lut: {(lut or edl.get('lut'))}")
     clips_dir = edit_dir / (
         "clips_draft" if draft else ("clips_preview" if preview else "clips_graded")
     )
@@ -373,7 +504,7 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, rate=out_rate)
+        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, rate=out_rate, lut_filter=lut_filter)
         seg_paths.append(out_path)
 
     return seg_paths
@@ -415,7 +546,27 @@ def _srt_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+_NONSPEECH_TOKEN = re.compile(r"^[\[\(<].*[\]\)>][.,;:!?]*$")
+
+
+def is_nonspeech_token(text: str) -> bool:
+    """True for a bracketed transcription artifact: [UH], [UM], (laughter).
+
+    A verbatim ASR writes fillers as bracket tags, which is exactly what makes
+    them findable when deciding a cut — but they are notation, not speech, and
+    burning "[UH]" onto the picture is a bug. Subtitling convention omits
+    fillers anyway.
+    """
+    return bool(_NONSPEECH_TOKEN.match(text.strip()))
+
+
 def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict]:
+    """Caption-bearing words overlapping [t_start, t_end).
+
+    Drops bracketed non-speech tokens, so this is the caption view of the
+    transcript — not the cut view. Read `transcript["words"]` directly when
+    picking cut edges, where a filler's timing is the whole point.
+    """
     out: list[dict] = []
     for w in transcript.get("words", []):
         if w.get("type") != "word":
@@ -425,6 +576,8 @@ def _words_in_range(transcript: dict, t_start: float, t_end: float) -> list[dict
         if ws is None or we is None:
             continue
         if we <= t_start or ws >= t_end:
+            continue
+        if is_nonspeech_token(w.get("text") or ""):
             continue
         out.append(w)
     return out
@@ -465,12 +618,22 @@ def chunk_words(words: list[dict]) -> list[list[dict]]:
     return chunks
 
 
-def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
+def build_master_srt(
+    edl: dict,
+    edit_dir: Path,
+    out_path: Path,
+    profanity_matcher: re.Pattern | None = None,
+) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
     - phrase-aware ~2-word chunks (see chunk_words)
     - UPPERCASE text
     - Output times computed as word.start - segment_start + segment_offset
+    - If `profanity_matcher` is given, each matched word is replaced with
+      literal "***" before joining — see helpers/profanity.py. This is the
+      caption side of --censor-profanity; find_censor_ranges() below is the
+      audio side, computed independently so audio stays censored even when
+      the EDL points at a hand-written subtitles file instead of this one.
     """
     transcripts_dir = edit_dir / "transcripts"
     sources = edl["sources"]
@@ -500,7 +663,10 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
             out_end = max(0.0, local_end - seg_start) + seg_offset
             if out_end <= out_start:
                 out_end = out_start + 0.4
-            text = " ".join((w.get("text") or "").strip() for w in chunk)
+            words_text = [(w.get("text") or "").strip() for w in chunk]
+            if profanity_matcher is not None:
+                words_text = [censor_word(t, profanity_matcher) for t in words_text]
+            text = " ".join(words_text)
             text = re.sub(r"\s+", " ", text).strip()
             # Strip trailing punctuation for cleaner uppercase look
             text = text.rstrip(",;:")
@@ -519,6 +685,80 @@ def build_master_srt(edl: dict, edit_dir: Path, out_path: Path) -> None:
         lines.append("")
     out_path.write_text("\n".join(lines))
     print(f"master SRT → {out_path.name} ({len(entries)} cues)")
+
+
+# -------- Profanity audio censoring (--censor-profanity) --------------------
+#
+# Pad is deliberately independent of Hard Rule 7's cut-edge padding (30-200ms):
+# that padding absorbs timestamp *drift* at a cut boundary; this padding exists
+# so a mute/bleep fully covers the word's actual audio even if the aligned
+# start/end is a touch tight, without eating into the neighboring word.
+CENSOR_PAD_S = 0.06
+CENSOR_BLEEP_HZ = 1000
+# ffmpeg's lavfi `sine` source has no amplitude option in this build and emits
+# a fixed, quiet ~0.125 peak — NOT full-scale. volume=4.0 on top of that lands
+# the tone around 0.5 peak / ~0.35 RMS, clearly audible over dialogue (RMS
+# ~0.15-0.2 in typical speech) without clipping. Measured empirically — see
+# tests/test_lut_and_censor.py — because ffmpeg's docs don't state the default.
+CENSOR_BLEEP_GAIN = 4.0
+
+
+def find_censor_ranges(
+    edl: dict,
+    edit_dir: Path,
+    matcher: re.Pattern,
+    pad: float = CENSOR_PAD_S,
+) -> list[tuple[float, float, str]]:
+    """Output-timeline (start, end, word) for every profane word, padded.
+
+    Walks the same per-range transcript lookup as build_master_srt, but at
+    word granularity rather than caption-chunk granularity — a censor
+    mute/bleep must cover exactly the word's audio, not the whole caption cue
+    it happens to share the screen with. Independent of whether captions are
+    being built at all, so audio stays censored even with --no-subtitles or
+    an EDL-provided subtitles file this function never reads.
+    """
+    transcripts_dir = edit_dir / "transcripts"
+    sources = edl["sources"]
+
+    ranges_out: list[tuple[float, float, str]] = []
+    seg_offset = 0.0
+
+    for r in edl["ranges"]:
+        src_name = r["source"]
+        seg_start = float(r["start"])
+        seg_end = float(r["end"])
+        seg_duration = seg_end - seg_start
+
+        tr_path = transcripts_dir / f"{src_name}.json"
+        if tr_path.exists():
+            transcript = json.loads(tr_path.read_text())
+            for w in _words_in_range(transcript, seg_start, seg_end):
+                text = (w.get("text") or "").strip()
+                if not is_profane(text, matcher):
+                    continue
+                local_start = max(seg_start, w.get("start", seg_start))
+                local_end = min(seg_end, w.get("end", seg_end))
+                out_start = max(0.0, local_start - seg_start) + seg_offset - pad
+                out_end = max(0.0, local_end - seg_start) + seg_offset + pad
+                ranges_out.append((max(0.0, out_start), out_end, text))
+
+        seg_offset += seg_duration
+
+    ranges_out.sort(key=lambda t: t[0])
+    return ranges_out
+
+
+def build_censor_enable_expr(ranges: list[tuple[float, float, str]]) -> str:
+    """ffmpeg `enable` boolean expression (unquoted): true while `t` is in ANY range.
+
+    `between(t,a,b)` is 0/1 per range; summed with `+` so ffmpeg's `enable`
+    (any nonzero = on) treats overlap or back-to-back ranges correctly without
+    needing to merge them first. The caller wraps this in single quotes —
+    same as the proven `overlay=enable='between(t,{t},{end})'` pattern a few
+    hundred lines down — so the commas need no escaping of their own.
+    """
+    return "+".join(f"between(t,{a:.3f},{b:.3f})" for a, b, _ in ranges) or "0"
 
 
 # -------- Loudness normalization (social-ready audio) -----------------------
@@ -636,22 +876,50 @@ def build_final_composite(
     subtitles_path: Path | None,
     out_path: Path,
     edit_dir: Path,
+    censor_ranges: list[tuple[float, float, str]] | None = None,
+    censor_mode: str = "bleep",
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
-    If there are no overlays and no subtitles, just copy base to out.
+    If there are no overlays, no subtitles, and nothing to censor, just copy
+    base to out.
+
+    `censor_ranges` (from find_censor_ranges) silences or bleeps the audio
+    over each (start, end) window on the OUTPUT timeline:
+      - "mute":  the original audio is volume-gated to 0 during each window.
+      - "bleep": the original audio is gated to 0 AND a 1kHz tone (gated ON
+        only during those same windows) is mixed in — a true replacement,
+        not just silence. `amix ... normalize=0` keeps this lossless: the two
+        inputs never overlap in time (one is silent exactly where the other
+        isn't), so summing them unscaled neither attenuates the untouched
+        audio nor needs headroom.
+    Either way this forces a real audio encode — `-c:a copy` cannot apply a
+    filter — so censoring, unlike plain overlays/subtitles, cannot take the
+    early-return copy path below even with nothing else to composite.
     """
     has_overlays = bool(overlays)
     has_subs = subtitles_path is not None and subtitles_path.exists()
+    censor_ranges = censor_ranges or []
+    has_censor = bool(censor_ranges)
 
-    if not has_overlays and not has_subs:
+    if not has_overlays and not has_subs and not has_censor:
         # Nothing to do — just rename/copy base to final name
         run(["ffmpeg", "-y", "-i", str(base_path), "-c", "copy", str(out_path)], quiet=True)
         return
 
     inputs: list[str] = ["-i", str(base_path)]
     for ov in overlays:
-        ov_path = resolve_path(ov["file"], edit_dir)
+        # Same dual-candidate resolution as subtitles — was plain resolve_path()
+        # before, which silently mis-resolved the exact path shape the EDL
+        # format example in SKILL.md itself uses ("edit/animations/.../render.mp4"
+        # doubling up against edit_dir already being ".../edit"), surfacing only
+        # as an opaque ffmpeg "No such file" minutes into a render.
+        ov_path = resolve_edl_asset_path(ov["file"], edit_dir)
+        if ov_path is None:
+            tried = ", ".join(
+                str(c) for c in (resolve_path(ov["file"], edit_dir), Path(ov["file"]).resolve())
+            )
+            sys.exit(f"overlay file in EDL not found: '{ov['file']}' (tried {tried})")
         inputs += ["-i", str(ov_path)]
 
     filter_parts: list[str] = []
@@ -674,7 +942,16 @@ def build_final_composite(
 
     # Subtitles LAST — Rule 1
     if has_subs:
-        subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
+        # Forward slashes even on Windows: a backslash is an escape character inside
+        # a filtergraph, so a native "C:\Users\..." path makes ffmpeg fail every
+        # subtitle burn. ffmpeg accepts "/" on Windows, so normalize before escaping
+        # the drive colon.
+        subs_abs = (
+            str(subtitles_path.resolve())
+            .replace("\\", "/")
+            .replace(":", r"\:")
+            .replace("'", r"\'")
+        )
         filter_parts.append(
             f"{current}subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
         )
@@ -685,7 +962,32 @@ def build_final_composite(
             filter_parts.append(f"{current}null[outv]")
             out_label = "[outv]"
         else:
-            out_label = "[0:v]"
+            # No video filtering at all (censor-only call: no overlays, no
+            # subs). Bracketed "[0:v]" is a filtergraph PAD reference — there
+            # is no such pad here, only the audio chain below populates
+            # filter_complex — so -map needs the raw stream specifier "0:v"
+            # (no brackets), same shape as audio_label's "0:a" default below.
+            out_label = "0:v"
+
+    # Audio: profanity censor, if requested. Comes after the video filter_parts
+    # are finalized above so appending here doesn't disturb any index math for
+    # the video chain; audio and video are independent chains in one graph.
+    audio_label = "0:a"
+    audio_codec_args = ["-c:a", "copy"]
+    if has_censor:
+        enable_expr = build_censor_enable_expr(censor_ranges)
+        if censor_mode == "mute":
+            filter_parts.append(f"[0:a]volume=enable='{enable_expr}':volume=0[outa]")
+        else:  # bleep — replace, don't just silence
+            sine_idx = 1 + len(overlays)
+            inputs += ["-f", "lavfi", "-i", f"sine=frequency={CENSOR_BLEEP_HZ}:sample_rate=48000"]
+            filter_parts.append(f"[0:a]volume=enable='{enable_expr}':volume=0[muted]")
+            filter_parts.append(
+                f"[{sine_idx}:a]volume=enable='{enable_expr}':volume={CENSOR_BLEEP_GAIN}[bleep]"
+            )
+            filter_parts.append("[muted][bleep]amix=inputs=2:duration=first:normalize=0[outa]")
+        audio_label = "[outa]"
+        audio_codec_args = ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
 
     filter_complex = ";".join(filter_parts)
 
@@ -694,15 +996,16 @@ def build_final_composite(
         *inputs,
         "-filter_complex", filter_complex,
         "-map", out_label,
-        "-map", "0:a",
+        "-map", audio_label,
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
         "-pix_fmt", "yuv420p",
-        "-c:a", "copy",
+        *audio_codec_args,
         "-movflags", "+faststart",
         str(out_path),
     ]
     print(f"compositing → {out_path.name}")
-    print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}")
+    print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}"
+          + (f", censored: {len(censor_ranges)} word(s) ({censor_mode})" if has_censor else ""))
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
@@ -746,7 +1049,38 @@ def main() -> None:
              "(falls back to 24 if it can't be probed). Pass e.g. --fps 30 or "
              "--fps 30000/1001 to force.",
     )
+    ap.add_argument(
+        "--lut",
+        type=str,
+        default=None,
+        help="Apply a 3D LUT by name from the lut/ folder (e.g. --lut "
+             "kodak_2383 for lut/kodak_2383.cube), or a path to a .cube file. "
+             "Overrides the EDL's 'lut' field. Runs after any grade filter.",
+    )
+    ap.add_argument(
+        "--censor-profanity",
+        action="store_true",
+        help="Redact profanity: captions show *** (only when generated by "
+             "--build-subtitles — an EDL-provided subtitles file is left "
+             "as-is), audio is bleeped. Wordlist: profanity/wordlist.txt, "
+             "or --censor-wordlist.",
+    )
+    ap.add_argument(
+        "--censor-wordlist",
+        type=Path,
+        default=None,
+        help="Custom profanity wordlist (one stem per line). "
+             "Default: profanity/wordlist.txt at the repo root.",
+    )
+    ap.add_argument(
+        "--censor-mute",
+        action="store_true",
+        help="Silence profanity instead of bleeping it. Only with --censor-profanity.",
+    )
     args = ap.parse_args()
+
+    if args.censor_mute and not args.censor_profanity:
+        ap.error("--censor-mute requires --censor-profanity")
 
     edl_path = args.edl.resolve()
     if not edl_path.exists():
@@ -758,7 +1092,7 @@ def main() -> None:
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft, fps=args.fps
+        edl, edit_dir, preview=args.preview, draft=args.draft, fps=args.fps, lut=args.lut
     )
 
     # 2. Concat → base
@@ -771,24 +1105,48 @@ def main() -> None:
     base_path = edit_dir / base_name
     concat_segments(segment_paths, base_path, edit_dir)
 
+    # 2b. Profanity: resolve the matcher once, find every flagged word's
+    # output-timeline position. Independent of subtitle building, so audio
+    # stays censored even with --no-subtitles.
+    profanity_matcher = None
+    censor_ranges: list[tuple[float, float, str]] = []
+    if args.censor_profanity:
+        stems = load_profanity_stems(args.censor_wordlist)
+        profanity_matcher = build_profanity_matcher(stems)
+        if profanity_matcher is None:
+            print(f"warning: profanity wordlist is empty "
+                  f"({args.censor_wordlist or 'profanity/wordlist.txt'}) — nothing to censor")
+        else:
+            censor_ranges = find_censor_ranges(edl, edit_dir, profanity_matcher)
+            flagged = sorted({w for _, _, w in censor_ranges})
+            print(f"profanity filter: {len(censor_ranges)} word(s) flagged"
+                  + (f" — {', '.join(flagged)}" if flagged else ""))
+
     # 3. Subtitles: build if requested, resolve final path
     subs_path: Path | None = None
     if not args.no_subtitles:
         if args.build_subtitles:
             subs_path = edit_dir / "master.srt"
-            build_master_srt(edl, edit_dir, subs_path)
+            build_master_srt(edl, edit_dir, subs_path, profanity_matcher=profanity_matcher)
         elif edl.get("subtitles"):
             subs_path = resolve_subtitles_path(edl["subtitles"], edit_dir)
+            if args.censor_profanity:
+                print("  note: EDL-provided subtitles are not generated here, so "
+                      "--censor-profanity cannot redact them — only the audio "
+                      "will be censored. Use --build-subtitles to censor captions too.")
 
     # 4. Composite (overlays + subtitles LAST) → intermediate (pre-loudnorm) path
     overlays = edl.get("overlays") or []
+    censor_mode = "mute" if args.censor_mute else "bleep"
     if args.no_loudnorm:
         # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
+        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir,
+                               censor_ranges=censor_ranges, censor_mode=censor_mode)
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
+        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir,
+                               censor_ranges=censor_ranges, censor_mode=censor_mode)
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)

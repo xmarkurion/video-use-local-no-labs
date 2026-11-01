@@ -24,10 +24,10 @@ These are the things where deviation produces silent failures or broken output. 
 3. **30ms audio fades at every segment boundary** (`afade=t=in:st=0:d=0.03,afade=t=out:st={dur-0.03}:d=0.03`). Otherwise audible pops at every cut.
 4. **Overlays use `setpts=PTS-STARTPTS+T/TB`** to shift the overlay's frame 0 to its window start. Otherwise you see the middle of the animation during the overlay window.
 5. **Master SRT uses output-timeline offsets**: `output_time = word.start - segment_start + segment_offset`. Otherwise captions misalign after segment concat.
-6. **Never cut inside a word.** Snap every cut edge to a word boundary from the Scribe transcript.
-7. **Pad every cut edge.** Working window: 30–200ms. Scribe timestamps drift 50–100ms — padding absorbs the drift. Tighter for fast-paced, looser for cinematic.
+6. **Never cut inside a word.** Snap every cut edge to a word boundary from the transcript.
+7. **Pad every cut edge.** Working window: 30–200ms. Forced-aligned timestamps drift ~30ms, hosted Scribe 50–100ms — padding absorbs the drift either way. Tighter for fast-paced, looser for cinematic.
 8. **Word-level verbatim ASR only.** Never SRT/phrase mode (loses sub-second gap data). Never normalized fillers (loses editorial signal).
-9. **Cache transcripts per source.** Never re-transcribe unless the source file itself changed.
+9. **Cache transcripts per source.** Never re-transcribe unless the source file itself changed — or unless you switched ASR backend or model, which the cache cannot see. Check `_video_use.model` in the JSON before trusting a transcript you did not make this session.
 10. **Parallel sub-agents for multiple animations.** Never sequential. Spawn N at once via the `Agent` tool; total wall time ≈ slowest one.
 11. **Strategy confirmation before execution.** Never touch the cut until the user has approved the plain-English plan.
 12. **All session outputs in `<videos_dir>/edit/`.** Never write inside the `video-use/` project directory.
@@ -45,7 +45,7 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
     ├── project.md               ← memory; appended every session
     ├── takes_packed.md          ← phrase-level transcripts, the LLM's primary reading view
     ├── edl.json                 ← cut decisions
-    ├── transcripts/<name>.json  ← cached raw Scribe JSON
+    ├── transcripts/<name>.json  ← cached raw word-level JSON (Scribe shape, either backend)
     ├── animations/slot_<id>/    ← per-animation source + render + reasoning
     ├── clips_graded/            ← per-segment extracts with grade + fades
     ├── master.srt               ← output-timeline subtitles
@@ -57,11 +57,12 @@ The skill lives in `video-use/`. User footage lives wherever they put it. All se
 
 ## Setup
 
-First-time install lives in `install.md` (clone, deps, ffmpeg, skill registration, API key). Don't re-run it every session; on cold start just verify:
+First-time install lives in `install.md` (clone, deps, ffmpeg, GPU check, skill registration). Don't re-run it every session; on cold start just verify:
 
-- `ELEVENLABS_API_KEY` resolves — either in the environment or in `.env` at the video-use repo root. If missing, ask the user to paste one and write it to `.env` (never to the user's `<videos_dir>`).
 - `ffmpeg` + `ffprobe` on PATH.
-- Python deps installed (`uv sync` or `pip install -e .` inside the repo).
+- Python deps installed, **including the `local` extra** (`uv sync --extra local`, or `pip install -e ".[local]"` inside the repo). `python -c "import whisperx"` is the fast check.
+- CUDA visible to torch: `python -c "import torch; print(torch.cuda.is_available())"`. `False` on a machine with an NVIDIA card means a CPU-only torch wheel — see `install.md`. It still works on CPU, just slowly; tell the user rather than letting them wait.
+- No API key is required. `HF_TOKEN` in `.env` only if the footage is multi-speaker and you want `--diarize`; `ELEVENLABS_API_KEY` only for the `--backend elevenlabs` fallback. Never write either to the user's `<videos_dir>`.
 - Node.js + npm available if the session needs HyperFrames or Remotion slots. HyperFrames currently requires Node.js 22+.
 - `yt-dlp`, HyperFrames, Remotion, Manim installed only on first use.
 - First-use animation setup happens inside the slot directory, never at the video-use repo root. HyperFrames can be invoked with `npx --yes hyperframes ...`; Remotion can be scaffolded with `npx create-video@latest` or installed as a project-local dependency before using its `remotion render` command.
@@ -71,12 +72,14 @@ Helpers (`helpers/transcribe.py`, `helpers/render.py`, etc.) live alongside this
 
 ## Helpers
 
-- **`transcribe.py <video>`** — single-file Scribe call. `--num-speakers N` optional. Cached.
-- **`transcribe_batch.py <videos_dir>`** — 4-worker parallel transcription. Use for multi-take.
+- **`transcribe.py <video>`** — single file, local GPU by default. `--diarize` (needs `HF_TOKEN`), `--num-speakers N`, `--audio-events` optional. Cached.
+- **`transcribe_batch.py <videos_dir>`** — whole directory. Loads the models once and runs sequentially on the local backend; 4 parallel uploads on `--backend elevenlabs`. Use for multi-take.
+- **`audio_events.py <path>`** — standalone AudioSet tagger, if you want `(laughter)`/`(applause)` spans for a source you already transcribed.
 - **`pack_transcripts.py --edit-dir <dir>`** — `transcripts/*.json` → `takes_packed.md` (phrase-level, break on silence ≥ 0.5s).
 - **`timeline_view.py <video> <start> <end>`** — filmstrip + waveform PNG. On-demand visual drill-down. **Not a scan tool** — use it at decision points, not constantly.
-- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline.
+- **`render.py <edl.json> -o <out>`** — per-segment extract → concat → overlays (PTS-shifted) → subtitles LAST. `--preview` for 720p fast. `--build-subtitles` to generate master.srt inline. `--lut <name>` applies a `.cube` from `lut/`. `--censor-profanity` (`--censor-mute` for silence instead of a bleep) redacts flagged words in captions and audio.
 - **`grade.py <in> -o <out>`** — ffmpeg filter chain grade. Presets + `--filter '<raw>'` for custom.
+- **`export_timeline.py <edl.json> -o <out.xml>`** — the EDL as an editable XMEML ("Final Cut Pro XML") timeline for DaVinci Resolve / Premiere Pro, instead of a flattened render. See "Exporting to an NLE" below.
 
 For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a sub-agent via the `Agent` tool.
 
@@ -112,6 +115,53 @@ For animations, create `<edit>/animations/slot_<id>/` with `Bash` and spawn a su
 - **Silence gaps are cut candidates.** Silences ≥400ms are usually the cleanest. 150–400ms phrase boundaries are usable with a visual check. <150ms is unsafe (mid-phrase).
 - **Example cut padding** (the launch video shipped with this): 50ms before the first kept word, 80ms after the last. Tighter for montage energy, looser for documentary. Stay in the 30–200ms working window (Hard Rule 7).
 - **Never reason audio and video independently.** Every cut must work on both tracks.
+
+## Transcription
+
+Local by default: WhisperX drives CrisperWhisper on the GPU, and word timestamps come from wav2vec2 forced alignment rather than Whisper's cross-attention DTW. Free, offline, no quota, and the footage never leaves the machine.
+
+```bash
+python helpers/transcribe_batch.py <videos_dir>                      # the normal case
+python helpers/transcribe_batch.py <videos_dir> --diarize --num-speakers 2
+python helpers/transcribe_batch.py <videos_dir> --audio-events
+```
+
+What each flag buys, and what it costs:
+
+| Flag | Gives you | Cost |
+|---|---|---|
+| *(default)* | Verbatim text + ~30ms word timestamps | ~1.5GB model download once, ~3GB VRAM |
+| `--diarize` | `speaker_id` per word | `HF_TOKEN`, +~1GB VRAM, ~0.3× realtime slower |
+| `--audio-events` | `(laughter)` / `(applause)` spans | +~0.4GB VRAM. **~1s resolution** — editorial signal, never a cut point |
+| `--model large-v3` | MIT-licensed weights | **Deletes every filler.** See the anti-patterns |
+| `--backend elevenlabs` | Hosted Scribe | Costs credits, needs a key, uploads the audio |
+
+Both backends write the same JSON shape, so nothing downstream cares which ran. A transcript records its own provenance in `_video_use`.
+
+**Fillers come back as bracket tags.** CrisperWhisper writes them `[UH]`, `[UM]`, `[MM]` — not "um". Measured on a real 60s meeting take:
+
+```
+CrisperWhisper  My gosh you've already pres produced a PowerPoint presentation [UH] I think
+                it's already on actually [UH] ... Okay, right, I know. Okay, right [UM] well
+                this is the kick-off meeting for our our project.          (42 words)
+
+large-v3        My gosh, you've already produced a PowerPoint presentation. I think it's
+                already on, actually. ... This is the kick-off meeting for our project.
+                                                                            (30 words)
+```
+
+`large-v3` dropped 29% of the words: all three fillers, the false start (`pres`), the repetition (`our our`), and one whole line. Each of those is a reason to prefer one take over another, and it is gone before you ever read the transcript.
+
+Two consequences:
+- **Finding fillers is now trivial** — match `^\[[A-Z]+\]$` instead of guessing which "um" was spoken. Use this for the cut-the-filler visual in the Animation section.
+- **They never reach the picture.** `render.py` drops bracketed tokens from captions (`is_nonspeech_token`), so a kept filler shows no subtitle. Read `transcript["words"]` directly when picking cut edges — `_words_in_range` is the caption view, not the cut view.
+
+**Verbatim is the whole point.** The default model keeps "um", "uh", stutters and false starts because that is the editorial signal you cut on — a take is worse than another take largely because of what it stumbles over. A transcript that reads cleanly has already thrown away the information you needed.
+
+**What is genuinely worse than hosted Scribe.** Say so rather than papering over it:
+- Audio events are coarse (~1s) and only cover a curated AudioSet list.
+- Diarization is opt-in and needs a gated-model token.
+- Non-English alignment depends on a wav2vec2 model existing for that language; `transcribe.py` warns and falls back to segment-level timing when one doesn't. Widen cut padding when you see that warning.
 
 ## The packed transcript (primary reading view)
 
@@ -179,6 +229,8 @@ For anything else — portraiture, nature, product, music video, documentary —
 
 Hard rules: apply **per-segment during extraction** (not post-concat, which re-encodes twice). Never go aggressive without testing skin tones.
 
+**3D LUTs.** A LUT is a different thing from `grade`: `grade` is corrective math (fix exposure/contrast/saturation), a LUT is a baked creative look or a camera log-to-Rec.709 conversion — a `.cube` file, dropped in `lut/` (see `lut/README.md`). Reference it by `--lut <name>` on `render.py`, or `"lut": "<name>"` in the EDL (CLI overrides EDL). Both can be on the same render — grade runs first, LUT last, same order a colorist layers a corrective node under a creative one. A camera/drone's own log-footage LUT (e.g. D-Log → Rec.709) almost always belongs here when the source is flat/log and the user hasn't manually graded it; ask if unsure which the footage is.
+
 ## Subtitles (when requested)
 
 Subtitles have three dimensions worth reasoning about: **chunking** (1/2/3/sentence per line), **case** (UPPER/Title/Natural), and **placement** (margin from bottom). The right combo depends on content.
@@ -197,6 +249,15 @@ Alignment=2,MarginV=35
 **`natural-sentence`** (if you invent this mode) — narrative, documentary, education. 4–7 word chunks, sentence case, break on natural pauses, `MarginV=60–80`, larger font for readability, slightly wider max-width. No shipped force_style — design one if you need it.
 
 Invent a third style if neither fits. Hard rules: subtitles LAST (Rule 1), output-timeline offsets (Rule 5).
+
+## Profanity filter (when requested)
+
+`render.py --censor-profanity`: captions show `***` in place of a flagged word, and the audio at that exact moment is bleeped (default, a 1kHz tone replacing it) or silenced (`--censor-mute`). Wordlist is `profanity/wordlist.txt` — plain text, one stem per line, user-editable, no code change needed (`--censor-wordlist <path>` for a custom one). Matching is stem + inflection (`-ing/-ed/-er/-ers/-es/-s`), not substring, so it never flags "assume" or "class" — see `helpers/profanity_filter.py` for the exact rule if you need to explain a miss or a false positive.
+
+What it does NOT do, say so if asked:
+- **Only redacts captions it generates itself.** Pair with `--build-subtitles`. An EDL-pointed, hand-written subtitles file is left untouched — audio still gets censored, captions don't; `render.py` prints this limitation when it applies.
+- **Only catches what's in the wordlist.** The default list is mainstream non-slur profanity (`fuck`, `shit`, `bitch`, etc.) — deliberately no slurs shipped by default. Extend the wordlist yourself for stricter or region-specific moderation.
+- **Censor padding (60ms each side) is separate from Hard Rule 7's cut-edge padding** — it exists to fully cover a word's audio even when alignment is a touch tight, not to absorb drift at a splice.
 
 ## Animations (when requested)
 
@@ -252,7 +313,7 @@ This is one style. If the brand is warm and serif, use that. If it's colorful an
 
 **Fonts fail silently.** A web font that didn't load renders in a fallback face with no error — the video ships in "almost Arial". In HyperFrames/Remotion, await the font load and then assert it: `if (!document.fonts.check('700 76px "Inter"')) throw new Error(...)`. In PIL, pass an explicit font path; never rely on the default.
 
-**Worked example — "show the edit" hook** (a launch video for this tool). Instead of a title card, the first 3s visualize the editing itself: each transcript word pops in on its Scribe timestamp, with bars under it drawn from the real audio envelope; a filler ("ummm") grows letter by letter while it is spoken, turns orange and is cut out on screen at the same frame the audio cuts, and the next line lands immediately. It works because the picture is *driven by the same data as the sound* — one composition (Remotion) reads frame-exact word/envelope JSON produced in Python, so nothing can drift. Use the idea whenever the story is "we removed something": make the removal visible.
+**Worked example — "show the edit" hook** (a launch video for this tool). Instead of a title card, the first 3s visualize the editing itself: each transcript word pops in on its forced-aligned timestamp, with bars under it drawn from the real audio envelope; a filler ("ummm") grows letter by letter while it is spoken, turns orange and is cut out on screen at the same frame the audio cuts, and the next line lands immediately. It works because the picture is *driven by the same data as the sound* — one composition (Remotion) reads frame-exact word/envelope JSON produced in Python, so nothing can drift. Use the idea whenever the story is "we removed something": make the removal visible.
 
 **Parallel sub-agent brief** — each animation is one sub-agent spawned via the `Agent` tool. Each prompt is self-contained (sub-agents have no parent context). Include:
 
@@ -296,6 +357,7 @@ Match the source unless the user asked for something specific. Common targets: `
      "beat": "SOLUTION", "quote": "...", "reason": "Only take without the false start."}
   ],
   "grade": "warm_cinematic",
+  "lut": "DJI OSMO Action 4 D-Log M to Rec.709 V1",
   "overlays": [
     {"file": "edit/animations/slot_1/render.mp4", "start_in_output": 0.0, "duration": 5.0}
   ],
@@ -304,7 +366,28 @@ Match the source unless the user asked for something specific. Common targets: `
 }
 ```
 
-`grade` is a preset name or raw ffmpeg filter. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST.
+`grade` is a preset name or raw ffmpeg filter. `lut` is optional, a name from `lut/` or a path to a `.cube` file — `--lut` on the command line overrides it. `overlays` are rendered animation clips. `subtitles` is optional and applied LAST. Profanity censoring (`--censor-profanity`) is a render-time CLI flag, not an EDL field — it's a delivery-format choice (clean cut vs. uncensored), not an editorial decision baked into the cut itself.
+
+## Exporting to an NLE (Premiere Pro / DaVinci Resolve)
+
+The default output is a flattened MP4. If the user wants to keep editing in Premiere or Resolve instead — ask when they say "export", "hand off", "open in Premiere/Resolve", or similar — use `export_timeline.py` on the same `edl.json` instead of (or alongside) `render.py`:
+
+```bash
+python helpers/export_timeline.py edit/edl.json -o edit/timeline.xml
+```
+
+It writes **XMEML** (`<xmeml version="5">`, the format Premiere's own File → Export → Final Cut Pro XML produces and Resolve has supported natively for years) — not true FCPXML. The two are both informally called "FCPXML" and are genuinely different schemas; XMEML is the one Adobe documents for third-party round-tripping with Premiere specifically, so it's the safer bet for this pair of apps. If the user explicitly wants Final Cut Pro X itself, that needs true FCPXML instead — different code path, not currently built.
+
+**What survives the handoff, what doesn't — say this plainly when you hand the file over, don't let the user discover it by surprise:**
+
+| | Result |
+|---|---|
+| Cuts (`ranges`) | ✅ exact — real source files, frame-accurate in/out |
+| Overlays | ✅ a second video track (V2), same compositing model as the MP4 render |
+| `grade` / `lut` | ⚠️ **not applied.** No portable way to embed a third-party color node both apps load identically — faking one would silently do nothing. Written as a comment on the sequence and on affected clips instead (exact preset/filter string, or the resolved `.cube` path to load on the color page by hand). |
+| `subtitles` | ⚠️ **not embedded** — xmeml predates any caption element both apps agree on. Left as the sidecar `.srt`; both apps import it directly (File → Import, or drag onto the timeline). |
+
+Source rate handling is per-source (each clip's `in`/`out` uses its own file's native frame rate even in a mixed-rate EDL), while the timeline position (`start`/`end`) uses one sequence rate — same frame-rate resolution policy as `render.py` (`--fps` to override, else probes the first source).
 
 ## Memory — `project.md`
 
@@ -328,7 +411,8 @@ Things that consistently fail regardless of style:
 - **Hierarchical pre-computed codec formats** with USABILITY / tone tags / shot layers. Over-engineering. Derive from the transcript at decision time.
 - **Hand-tuned moment-scoring functions.** The LLM picks better than any heuristic you'll write.
 - **Whisper SRT / phrase-level output.** Loses sub-second gap data. Always word-level verbatim.
-- **Running Whisper locally on CPU.** Slow and it normalizes fillers. Use hosted Scribe.
+- **Stock Whisper for a cut.** `large-v3` silently deletes the fillers, stutters and false starts that the edit exists to remove — the editorial signal is gone before you read the transcript. The default local model is CrisperWhisper, which is trained to keep them. If you must use `large-v3` (its licence is MIT, CrisperWhisper's weights are not), say so in `project.md` and stop promising filler-aware cuts.
+- **Whisper's own word timestamps.** Whisper derives them from cross-attention DTW and they drift. Always go through forced alignment — `transcribe.py` does, via WhisperX.
 - **Burning subtitles into base before compositing overlays.** Overlays hide them. (Hard Rule 1.)
 - **Single-pass filtergraph when you have overlays.** Double re-encodes. Use per-segment extract → concat.
 - **Linear animation easing.** Looks robotic. Always cubic.

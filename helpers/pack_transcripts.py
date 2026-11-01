@@ -1,9 +1,9 @@
-"""Pack all Scribe transcripts in <edit>/transcripts/ into one readable markdown.
+"""Pack all transcripts in <edit>/transcripts/ into one readable markdown.
 
 Groups word-level entries into phrase-level lines, breaking on any silence
 >= 0.5s OR speaker change. Each phrase gets a [start-end] prefix. This is
 the PRIMARY artifact the editor sub-agent reads to pick cuts — it fits one
-hour of takes in a tenth the tokens of raw Scribe JSON and gives
+hour of takes in a tenth the tokens of the raw JSON and gives
 word-boundary precision from text alone.
 
 Output: <edit>/takes_packed.md
@@ -39,10 +39,11 @@ def group_into_phrases(
     words: list[dict],
     silence_threshold: float = 0.5,
 ) -> list[dict]:
-    """Walk a Scribe word list, break into phrases on silence >= threshold
+    """Walk a word list, break into phrases on silence >= threshold
     OR speaker change. Returns list of {start, end, text, speaker_id}.
 
-    Scribe `words` entries have types 'word', 'spacing', or 'audio_event'.
+    `words` entries have types 'word', 'spacing', or 'audio_event' - the Scribe
+    shape, which the local backend also emits.
     We keep 'word' and 'audio_event' content in phrase text. 'spacing'
     entries carry the silence information via their start/end times.
     """
@@ -150,7 +151,7 @@ def render_markdown(entries: list[tuple[str, float, list[dict]]], silence_thresh
         for p in phrases:
             spk = p.get("speaker_id")
             if spk is not None:
-                # Scribe returns IDs like "speaker_0" — strip the prefix for readability
+                # IDs look like "speaker_0" — strip the prefix for readability
                 spk_str = str(spk)
                 if spk_str.startswith("speaker_"):
                     spk_str = spk_str[len("speaker_"):]
@@ -163,7 +164,7 @@ def render_markdown(entries: list[tuple[str, float, list[dict]]], silence_thresh
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Pack Scribe transcripts into takes_packed.md")
+    ap = argparse.ArgumentParser(description="Pack word-level transcripts into takes_packed.md")
     ap.add_argument("--edit-dir", type=Path, required=True, help="Edit directory containing transcripts/")
     ap.add_argument(
         "--silence-threshold",

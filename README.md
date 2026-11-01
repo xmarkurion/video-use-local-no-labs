@@ -10,12 +10,16 @@ Drop raw footage in a folder, chat with Claude Code, get `final.mp4` back. Works
 
 Cloud-hosted video-use is coming. [Join the waitlist at video-use.com](https://video-use.com?utm_source=github).
 
+**→ [`QUICKSTART.md`](./QUICKSTART.md)** — install + run, both with an agent and fully by hand (plain CLI, no agent required).
+
 ## What it does
 
 - **Cuts out filler words** (`umm`, `uh`, false starts) and dead space between takes
-- **Auto color grades** every segment (warm cinematic, neutral punch, or any custom ffmpeg chain)
+- **Auto color grades** every segment (warm cinematic, neutral punch, or any custom ffmpeg chain) — plus optional **3D LUTs**: drop a `.cube` in `lut/`, apply with `--lut`
 - **30ms audio fades** at every cut so you never hear a pop
 - **Burns subtitles** in your style — 2-word UPPERCASE chunks by default, fully customizable
+- **Censors profanity** on request — `***` in captions, a bleep (or silence) in the audio, at the exact word
+- **Exports an editable timeline** to DaVinci Resolve or Premiere Pro, instead of (or alongside) a flattened render
 - **Generates animation overlays** via [HyperFrames](https://github.com/heygen-com/hyperframes), [Remotion](https://www.remotion.dev/), [Manim](https://www.manim.community/), or PIL — spawned in parallel sub-agents, one per animation
 - **Self-evaluates the rendered output** at every cut boundary before showing you anything
 - **Persists session memory** in `project.md` so next week's session picks up where you left off
@@ -27,10 +31,10 @@ Paste into Claude Code, Codex, Hermes, Openclaw, or any agent with shell access:
 ```text
 Set up https://github.com/browser-use/video-use for me.
 
-Read install.md first to install this repo, wire up ffmpeg, register the skill with whichever agent you're running under, and set up the ElevenLabs API key — ask me to paste it when you need it. Then read SKILL.md for daily usage, and always read helpers/ because that's where the editing scripts live. After install, don't transcribe anything on your own — just tell me it's ready and wait for me to drop footage into a folder.
+Read install.md first to install this repo, wire up ffmpeg, check my GPU, and register the skill with whichever agent you're running under. Then read SKILL.md for daily usage, and always read helpers/ because that's where the editing scripts live. After install, don't transcribe anything on your own — just tell me it's ready and wait for me to drop footage into a folder.
 ```
 
-The agent handles the clone, dependencies, skill registration, and prompts you once for your ElevenLabs API key (grab one at [elevenlabs.io/app/settings/api-keys](https://elevenlabs.io/app/settings/api-keys)).
+The agent handles the clone, dependencies, GPU check and skill registration. **No API key, no account, no quota** — transcription runs on your own GPU and your footage never leaves the machine.
 
 Then point your agent at a folder of raw takes:
 
@@ -57,16 +61,18 @@ git clone https://github.com/browser-use/video-use ~/Developer/video-use
 ln -sfn ~/Developer/video-use ~/.claude/skills/video-use        # Claude Code
 # ln -sfn ~/Developer/video-use ~/.codex/skills/video-use       # Codex
 
-# 2. Install deps
+# 2. Install deps (the [local] extra is GPU transcription: whisperx + torch, ~3GB)
 cd ~/Developer/video-use
-uv sync                         # or: pip install -e .
+uv sync --extra local           # or: pip install -e ".[local]"
 brew install ffmpeg             # required
 brew install yt-dlp             # optional, for downloading online sources
 
-# 3. Add your ElevenLabs API key
+# 3. Nothing to configure. Optional extras only:
 cp .env.example .env
-$EDITOR .env                    # ELEVENLABS_API_KEY=...
+$EDITOR .env                    # HF_TOKEN=...  for speaker diarization
 ```
+
+Needs an NVIDIA GPU with ~6GB of VRAM for the defaults. It runs on CPU too, just slowly — or pass `--backend elevenlabs` if you'd rather use hosted Scribe.
 
 ## How it works
 
@@ -76,7 +82,17 @@ The LLM never watches the video. It **reads** it — through two layers that tog
   <img src="static/timeline-view.svg" alt="timeline_view composite — filmstrip + speaker track + waveform + word labels + silence-gap cut candidates" width="100%">
 </p>
 
-**Layer 1 — Audio transcript (always loaded).** One ElevenLabs Scribe call per source gives word-level timestamps, speaker diarization, and audio events (`(laughter)`, `(applause)`, `(sigh)`). All takes pack into a single ~12KB `takes_packed.md` — the LLM's primary reading view.
+**Layer 1 — Audio transcript (always loaded).** Each source is transcribed locally to word-level timestamps, with optional speaker labels and audio events (`(laughter)`, `(applause)`, `(sigh)`). All takes pack into a single ~12KB `takes_packed.md` — the LLM's primary reading view.
+
+The transcript is **verbatim**: every "um", stutter and false start is kept, because that is the signal you cut on. Three models, each doing the one thing it is best at:
+
+| | | |
+|---|---|---|
+| [CrisperWhisper](https://github.com/nyrahealth/CrisperWhisper) | verbatim text | keeps the fillers stock Whisper deletes |
+| [WhisperX](https://github.com/m-bain/whisperX) + wav2vec2 | word timestamps | forced alignment, ~30ms — not Whisper's drifting DTW |
+| [pyannote](https://huggingface.co/pyannote/speaker-diarization-community-1) | `speaker_id` | opt-in, `--diarize` |
+
+CrisperWhisper's weights are CC-BY-NC-4.0 (research/personal). For commercial work, license them or pass `--model large-v3` — MIT, but it normalizes the fillers away.
 
 ```
 ## C0103  (duration: 43.0s, 8 phrases)

@@ -13,7 +13,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Local GPU transcription. ~3GB of wheels (torch brings most of it), so it is an
+# extra rather than a hard dependency - but it is what `transcribe.py` uses by
+# default. Install with: pip install -e ".[local]"
+#
+# whisperx pulls faster-whisper, ctranslate2, pyannote-audio and torch, and
+# bundles its own VAD weights. transformers is already in that tree; it is named
+# here because audio_events.py imports it directly.
+local = [
+    "whisperx>=3.8.6",
+    "transformers>=4.48.0",
+]
 animations = ["manim"]
+# Offline TTS for narrated animations - see skills/manim-video/references/rendering.md
+tts = ["manim-voiceover", "kokoro>=0.9.4", "soundfile"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

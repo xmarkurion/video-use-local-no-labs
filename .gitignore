@@ -58,3 +58,11 @@ master.srt
 takes_packed.md
 edl.json
 project.md
+
+# LUTs are personal grading assets (camera-specific, sometimes licensed) —
+# drop your own in lut/, see lut/README.md. The README itself stays tracked.
+lut/*.cube
+lut/*.3dl
+lut/*.csp
+lut/*.dat
+lut/*.m3d

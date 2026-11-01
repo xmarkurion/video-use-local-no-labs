@@ -1,0 +1,42 @@
+# video-use profanity wordlist
+#
+# One stem per line, lowercase. '#' starts a comment; blank lines are ignored.
+# Loaded by helpers/profanity_filter.py when render.py is run with --censor-profanity.
+#
+# Matching is stem + common inflection (-ing / -ed / -er / -ers / -es / -s),
+# not substring — "ass" matches "ass"/"asses"/"assed", never "assume" or
+# "class". So this list only needs the base word, not every tense of it.
+#
+# This default set is mainstream English profanity — the words most
+# "clean cut" / monetization-safe edits bleep. It deliberately does NOT
+# include slurs. Add your own lines below for stricter, regional, or
+# platform-specific moderation (e.g. uncomment the mild words, or add
+# slurs you need flagged for your own content) — this file is yours to edit,
+# nothing in helpers/ needs to change.
+#
+# Custom wordlist: python helpers/render.py edl.json -o out.mp4 \
+#   --censor-profanity --censor-wordlist path/to/your_list.txt
+
+fuck
+motherfucker
+shit
+bullshit
+bitch
+asshole
+ass
+bastard
+dick
+cock
+pussy
+cunt
+whore
+slut
+piss
+douche
+douchebag
+goddamn
+
+# Mild — commonly left in. Uncomment for a stricter / kids-safe cut:
+# damn
+# hell
+# crap
