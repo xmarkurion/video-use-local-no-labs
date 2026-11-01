@@ -26,6 +26,19 @@ import json
 import re
 import subprocess
 import sys
+
+# Windows' legacy console codepage (cp1252) can't encode some characters that
+# show up in these prints (an em dash is fine; a unicode arrow like U+2192
+# raised UnicodeEncodeError and crashed the run after the real work was
+# already done and the output file already written). Force UTF-8 stdout/
+# stderr so prose text never crashes a run regardless of what a future edit
+# adds. Wrapped in try/except: reconfigure can itself fail against some
+# redirected/piped streams, and a cosmetic safety net must never be fatal.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 from fractions import Fraction
 from pathlib import Path
 
@@ -264,8 +277,11 @@ def is_hdr_source(video: Path) -> bool:
         return False
 
 
-def is_portrait_source(video: Path) -> bool:
-    """Return True if the displayed video is portrait, including rotation."""
+def probe_display_dimensions(video: Path) -> tuple[int, int] | None:
+    """(width, height) as actually displayed, i.e. after rotation-side-data
+    normalization. Shared by is_portrait_source and probe_source_long_edge so
+    the rotation-swap logic exists in exactly one place.
+    """
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -276,7 +292,7 @@ def is_portrait_source(video: Path) -> bool:
         )
         streams = json.loads(out.stdout).get("streams") or []
         if not streams:
-            return False
+            return None
         stream = streams[0]
         w, h = int(stream["width"]), int(stream["height"])
 
@@ -291,7 +307,7 @@ def is_portrait_source(video: Path) -> bool:
                 break
         if int(round(float(rotation))) % 360 in (90, 270):
             w, h = h, w
-        return h > w
+        return w, h
     except (
         subprocess.CalledProcessError,
         json.JSONDecodeError,
@@ -301,7 +317,24 @@ def is_portrait_source(video: Path) -> bool:
         TypeError,
         ValueError,
     ):
-        return False
+        return None
+
+
+def is_portrait_source(video: Path) -> bool:
+    """Return True if the displayed video is portrait, including rotation."""
+    dims = probe_display_dimensions(video)
+    return dims is not None and dims[1] > dims[0]
+
+
+def probe_source_long_edge(video: Path) -> int | None:
+    """The longer display edge in pixels, rotation-aware. This is what the
+    `width` parameter through extract_segment actually targets: scale WIDTH
+    for a landscape source, scale HEIGHT for a portrait one — "long edge" is
+    the one number both cases share, so it's the natural unit for "how big
+    is this source" regardless of orientation.
+    """
+    dims = probe_display_dimensions(video)
+    return max(dims) if dims else None
 
 
 def parse_fps(value: str) -> str:
@@ -360,7 +393,119 @@ def probe_source_fps(video: Path) -> str | None:
     return None
 
 
+def probe_duration(video: Path) -> float | None:
+    """Container duration in seconds, or None if it can't be probed."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(video)],
+            capture_output=True, text=True, check=True,
+        )
+        text = out.stdout.strip()
+        return float(text) if text else None
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return None
+
+
+def clamp_range_to_source(
+    source: Path,
+    start: float,
+    end: float,
+    fps: str | None = None,
+    label: str = "",
+) -> tuple[float, float]:
+    """Clamp a [start, end) range so it never reads past the source's last frame.
+
+    Word-boundary padding (Hard Rule 7) plus frame rounding can push `end`
+    a touch past the file's real duration — harmless for `-t`-bounded reads
+    (ffmpeg just truncates), but it silently shorts the segment: on a short
+    clip (a title/end card is the case that actually bit this) the shortfall
+    can be the whole clip, read as "this section never rendered." Clamping
+    here, once, before extraction, is cheaper and more honest than debugging
+    a missing segment after the fact.
+
+    `fps` is this SOURCE's own margin, not the sequence rate: on a mixed-rate
+    EDL (a 47.952fps camera cut next to a 30fps screen recording is the case
+    this was found on) "2 frames of margin" means something different per
+    file. Omit it to probe the source's own rate automatically.
+    """
+    duration = probe_duration(source)
+    if duration is None:
+        return start, end
+    rate_str = fps or probe_source_fps(source) or "24"
+    rate = Fraction(rate_str)
+    limit = duration - 2 / float(rate)  # never the source's last frame or beyond
+    if end > limit:
+        print(f"  warning: {label or source.name} range end {end:.3f}s exceeds "
+              f"source duration {duration:.3f}s — clamped to {max(start, limit):.3f}s")
+        end = max(start, limit)
+    return start, end
+
+
+def clamp_edl_ranges(edl: dict, edit_dir: Path) -> int:
+    """Clamp every EDL range's `end` to its own source's duration, IN PLACE.
+
+    Mutates `edl["ranges"]` rather than returning a copy so every later
+    consumer of this same EDL object — extract_all_segments, build_master_srt,
+    find_censor_ranges, export_timeline.py's build_timeline — sees identical,
+    already-clamped numbers. Call this once, right after loading the EDL,
+    before anything else reads `ranges`: clamping deep inside one consumer
+    only fixes what that one consumer renders, while every other output
+    (captions, the exported XML, the reported total duration) silently keeps
+    disagreeing with it.
+
+    Returns how many ranges were clamped.
+    """
+    sources = edl.get("sources") or {}
+    clamped = 0
+    for r in edl.get("ranges") or []:
+        src_path = resolve_path(sources[r["source"]], edit_dir)
+        start = float(r["start"])
+        end = float(r["end"])
+        new_start, new_end = clamp_range_to_source(
+            src_path, start, end, label=r.get("beat") or r["source"],
+        )
+        if new_end != end:
+            r["end"] = new_end
+            clamped += 1
+    return clamped
+
+
 # -------- Per-segment extraction (Rule 2 + Rule 3) --------------------------
+
+
+DEFAULT_WIDTH = 1920  # last-resort fallback only — see probe_max_resolution below;
+                       # render.py's own CLI default is the source's own max resolution, not this
+
+
+def probe_max_resolution(edl: dict, edit_dir: Path) -> tuple[int, dict[str, int]]:
+    """The long edge (pixels) of the HIGHEST-resolution source actually used
+    in edl["ranges"], plus a per-source breakdown for the caller to print.
+
+    This is render.py's real default output size when neither --width nor
+    --res is given: previously a flat 1920 (1080p) regardless of what the
+    footage actually was, silently downscaling 4K source and silently
+    upscaling anything smaller. "Resolution" here means the per-source LONG
+    EDGE (rotation-aware) — the same unit extract_segment's own `width`
+    parameter already targets for both landscape and portrait sources — so a
+    mix of orientations compares correctly without a separate portrait case.
+
+    Falls back to DEFAULT_WIDTH only if nothing in the EDL could be probed
+    (e.g. an empty EDL, or every source is unreadable).
+    """
+    sources = edl.get("sources") or {}
+    used_names = {r["source"] for r in (edl.get("ranges") or [])}
+    per_source: dict[str, int] = {}
+    for name in used_names:
+        if name not in sources:
+            continue
+        path = resolve_path(sources[name], edit_dir)
+        edge = probe_source_long_edge(path)
+        if edge:
+            per_source[name] = edge
+    if not per_source:
+        return DEFAULT_WIDTH, per_source
+    return max(per_source.values()), per_source
 
 
 def extract_segment(
@@ -373,24 +518,47 @@ def extract_segment(
     draft: bool = False,
     rate: str | None = None,
     lut_filter: str = "",
+    width: int = DEFAULT_WIDTH,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + LUT + 30ms audio fades baked in.
 
-    `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
-    Portrait sources (height > width) are scaled by height to preserve orientation.
+    `-ss` before `-i` for fast accurate seeking. Scale from source resolution
+    to `width` — render.py's CLI resolves this to the EDL's own max native
+    resolution by default (see probe_max_resolution), or `--res`/`--width`
+    if given; this function's own `width=DEFAULT_WIDTH` fallback only
+    applies to a caller that doesn't pass one explicitly. Portrait sources
+    (height > width) are scaled by height instead, to preserve orientation.
 
-    Quality ladder:
-      - final (default): 1080p libx264 fast CRF 20
-      - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
-      - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
+    Frame-exact by construction, not by luck: `-t` alone lets ffmpeg round the
+    VIDEO stream up to the next whole frame while the AUDIO stream truncates
+    to the exact requested duration — on their own that's sub-frame, but
+    concat is lossless (`-c copy`, Rule 2) and never re-aligns anything, so
+    the mismatch is pure addition across segments. On a real 50-cut timeline
+    this drifted video ~1s ahead of audio by the end, and master.srt (built
+    from the EDL's own seconds) drifted against the rendered MP4 right along
+    with it. Fix: quantize `duration` to a whole number of output frames
+    BEFORE building the command, pin the video stream to exactly that frame
+    count (`-frames:v`, not `-t`), and force the audio to the same quantized
+    duration explicitly (`apad,atrim`) before the fades run on top of it.
+
+    Quality ladder — resolution (the `width` parameter) is the SAME across
+    final/preview, only the encode settings change; draft always drops to a
+    fixed 1280 regardless of `width`, since it's a cut-point check, not a
+    preview of the delivery resolution:
+      - final (default): libx264 fast CRF 20, at `width` (source's own max
+                          native resolution unless --res/--width override it)
+      - preview:          libx264 medium CRF 22, same `width` as final
+      - draft:             libx264 ultrafast CRF 28, fixed 1280 (cut-point check only)
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     portrait = is_portrait_source(source)
-    if draft:
-        scale = "scale=-2:1280" if portrait else "scale=1280:-2"
-    else:
-        scale = "scale=-2:1920" if portrait else "scale=1920:-2"
+    draft_width = 1280  # fixed regardless of --res — draft is a speed tool, not a preview of the delivery resolution
+    target_width = draft_width if draft else width
+    scale = (
+        f"scale=-2:{target_width}:flags=lanczos" if portrait
+        else f"scale={target_width}:-2:flags=lanczos"
+    )
 
     vf_parts: list[str] = []
     if is_hdr_source(source):
@@ -402,11 +570,8 @@ def extract_segment(
     # same order a colorist layers a corrective node under a creative node.
     if lut_filter:
         vf_parts.append(lut_filter)
+    vf_parts.append("format=yuv420p")
     vf = ",".join(vf_parts)
-
-    # 30ms audio fades at both edges (Rule 3) — prevent pops
-    fade_out_start = max(0.0, duration - 0.03)
-    af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
 
     if draft:
         preset, crf = "ultrafast", "28"
@@ -420,16 +585,50 @@ def extract_segment(
     # frame rate). When called standalone with no rate, preserve this source's
     # own rate; fall back to 24 only if it can't be probed.
     out_rate = rate if rate is not None else (probe_source_fps(source) or "24")
+    fps = Fraction(out_rate)
+
+    # Quantize to a whole number of OUTPUT frames. nfr is what actually gets
+    # encoded; `duration` is updated to match it exactly so every downstream
+    # consumer (the afade timing below, the audio apad/atrim, any caller
+    # accumulating seg_offset for captions/XML) works from the same number.
+    nfr = max(1, round(duration * float(fps)))
+    duration = nfr / float(fps)
+    fade_out_start = max(0.0, duration - 0.03)
+
+    af = (
+        # 48kHz stereo first so apad/atrim/afade all operate on a known,
+        # consistent format regardless of the source's own audio layout.
+        "aresample=48000,aformat=channel_layouts=stereo,"
+        # Force the EXACT quantized duration — apad covers a source that
+        # undershoots (silence, not wrong-length fades), atrim covers a
+        # source that overshoots (ffmpeg's own audio decode is sample-exact,
+        # but the +0.5s input overshoot below reads well past `duration`).
+        f"apad,atrim=0:{duration:.6f},"
+        f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
+    )
 
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{seg_start:.3f}",
         "-i", str(source),
-        "-t", f"{duration:.3f}",
+        # Read past the quantized duration — -frames:v below is what actually
+        # bounds the video output; this just guarantees enough source decoded
+        # to reach that frame count without an early EOF truncating it short.
+        "-t", f"{duration + 0.5:.3f}",
+        # Explicit stream selection: a source can carry a data/tmcd (timecode)
+        # stream alongside video+audio (common from cameras and OBS alike),
+        # which a bare `ffmpeg -i ... -c:v ... -c:a ...` command happily
+        # passes through into the segment. That stray stream can confuse a
+        # later `-c copy` concat or an NLE import. -map pins exactly
+        # video+audio; -write_tmcd 0 and -map_metadata -1 stop ffmpeg from
+        # synthesizing or carrying forward timecode/metadata of its own.
+        "-map", "0:v:0", "-map", "0:a:0", "-write_tmcd", "0", "-map_metadata", "-1",
         "-vf", vf,
+        "-frames:v", str(nfr),
         "-af", af,
         "-c:v", "libx264", "-preset", preset, "-crf", crf,
         "-pix_fmt", "yuv420p", "-r", out_rate,
+        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
         str(out_path),
@@ -444,23 +643,43 @@ def extract_all_segments(
     draft: bool = False,
     fps: str | None = None,
     lut: str | None = None,
-) -> list[Path]:
+    width: int = DEFAULT_WIDTH,
+) -> tuple[list[Path], str]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
-    Returns the ordered list of segment paths.
+    Returns (the ordered list of segment paths, the resolved output fps
+    string) — the caller needs the rate too, e.g. to size a post-render
+    duration-drift tolerance in whole frames rather than a guessed constant.
+
+    Assumes ranges are already clamped to their sources — call
+    clamp_edl_ranges(edl, edit_dir) once before this, not per-call here, so
+    every other consumer of the same EDL (captions, censor ranges, the XML
+    export) agrees with what actually got rendered.
 
     If the EDL `grade` is "auto", analyze each segment range with
     `auto_grade_for_clip` and apply a per-segment subtle correction.
     Otherwise, apply the same preset/raw filter to every segment.
 
-    `lut`: CLI --lut value, or None to fall back to the EDL's own "lut" field.
-    A LUT is global to the render (one "look"), unlike grade which can be
-    "auto" per segment — so it's resolved once here, not per-range.
+    LUT resolution, most specific wins: a range's own `"lut"` field, else
+    `edl["luts"][source_name]`, else `lut` (CLI --lut) or the EDL's top-level
+    `"lut"`. A single global LUT breaks the moment one source is log footage
+    and another is a screen recording — those need different (or no) LUTs on
+    the same timeline.
     """
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
-    lut_filter = resolve_lut_filter(lut or edl.get("lut"), edit_dir)
-    if lut_filter:
-        print(f"  lut: {(lut or edl.get('lut'))}")
+    global_lut = lut or edl.get("lut")
+    per_source_luts: dict = edl.get("luts") or {}
+    lut_filter_cache: dict[str, str] = {}
+
+    def lut_filter_for(r: dict, src_name: str) -> str:
+        name = r.get("lut") or per_source_luts.get(src_name) or global_lut
+        if not name:
+            return ""
+        if name not in lut_filter_cache:
+            lut_filter_cache[name] = resolve_lut_filter(name, edit_dir)
+            print(f"  lut ({src_name}): {name}")
+        return lut_filter_cache[name]
+
     clips_dir = edit_dir / (
         "clips_draft" if draft else ("clips_preview" if preview else "clips_graded")
     )
@@ -483,8 +702,8 @@ def extract_all_segments(
         out_rate = "24"
 
     seg_paths: list[Path] = []
-    print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/  @ {out_rate} fps"
-          f"{' (forced)' if fps is not None else ' (from source)'}")
+    print(f"extracting {len(ranges)} segment(s) -> {clips_dir.name}/  @ {out_rate} fps, {width}w"
+          f"{' (forced fps)' if fps is not None else ' (fps from source)'}")
     if is_auto:
         print("  (auto-grade per segment: analyzing each range)")
     for i, r in enumerate(ranges):
@@ -499,15 +718,20 @@ def extract_all_segments(
             seg_filter, _stats = auto_grade_for_clip(src_path, start=start, duration=duration, verbose=False)
         else:
             seg_filter = resolved
+        seg_lut_filter = lut_filter_for(r, src_name)
 
         note = r.get("beat") or r.get("note") or ""
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, rate=out_rate, lut_filter=lut_filter)
+        extract_segment(
+            src_path, start, duration, seg_filter, out_path,
+            preview=preview, draft=draft, rate=out_rate,
+            lut_filter=seg_lut_filter, width=width,
+        )
         seg_paths.append(out_path)
 
-    return seg_paths
+    return seg_paths, out_rate
 
 
 # -------- Lossless concat ----------------------------------------------------
@@ -527,7 +751,7 @@ def concat_segments(segment_paths: list[Path], out_path: Path, edit_dir: Path) -
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"concat → {out_path.name}")
+    print(f"concat -> {out_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     concat_list.unlink(missing_ok=True)
 
@@ -618,25 +842,112 @@ def chunk_words(words: list[dict]) -> list[list[dict]]:
     return chunks
 
 
+# -------- "natural" subtitle style (sentence case, readable, no burn) -------
+#
+# bold-overlay (above) is a deliberate style: short, punchy, UPPERCASE,
+# built to be burned into frame. It reads badly as a plain SRT a viewer
+# toggles on in a native player — this style is for that case instead:
+# sentence case, readable line lengths, cues that don't flash or overlap.
+
+NATURAL_MAX_CHARS = 42
+NATURAL_MAX_WORDS = 8
+NATURAL_PAUSE_S = 0.45
+NATURAL_MIN_CUE_S = 1.0
+
+
+def chunk_words_natural(
+    words: list[dict],
+    max_chars: int = NATURAL_MAX_CHARS,
+    max_words: int = NATURAL_MAX_WORDS,
+    pause_s: float = NATURAL_PAUSE_S,
+) -> list[list[dict]]:
+    """Group words into reading-length cues: break on sentence punctuation,
+    a pause >= pause_s, or hitting the word/character cap — whichever comes
+    first. Unlike chunk_words (2-3 words, built to flash fast under a burned
+    caption), this optimizes for a cue a viewer can actually read as text."""
+    words = [w for w in words if (w.get("text") or "").strip()]
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    for i, w in enumerate(words):
+        current.append(w)
+        text = w["text"].strip()
+        nxt = words[i + 1] if i + 1 < len(words) else None
+        gap = (nxt["start"] - w["end"]) if nxt else 0.0
+        joined_len = len(" ".join(x["text"].strip() for x in current))
+        next_len = joined_len + 1 + len(nxt["text"].strip()) if nxt else joined_len
+        if (
+            nxt is None
+            or text[-1:] in ".?!"
+            or gap >= pause_s
+            or len(current) >= max_words
+            or next_len > max_chars
+        ):
+            chunks.append(current)
+            current = []
+    return chunks
+
+
+def load_text_fixes(path: Path | None) -> list[tuple[str, str]]:
+    """User-supplied ASR correction list for cue text: one `pattern<TAB>
+    replacement` per line (`#` comments, blank lines skipped), applied as
+    regex substitutions in order. Real transcripts mishear specific proper
+    nouns/jargon consistently (a product name, a technical term) — this is
+    how a project fixes "that's our effect" -> "that's our copy" without
+    re-transcribing or patching the raw word data itself."""
+    if path is None:
+        return []
+    if not path.exists():
+        sys.exit(f"--text-fixes file not found: {path}")
+    fixes: list[tuple[str, str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].rstrip("\n")
+        if not line.strip():
+            continue
+        if "\t" not in line:
+            sys.exit(f"--text-fixes line has no tab separator: {line!r} "
+                      f"(expected 'pattern<TAB>replacement')")
+        pattern, replacement = line.split("\t", 1)
+        if pattern.strip():
+            fixes.append((pattern.strip(), replacement.strip()))
+    return fixes
+
+
+def _apply_text_fixes(text: str, fixes: list[tuple[str, str]]) -> str:
+    for pattern, replacement in fixes:
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
 def build_master_srt(
     edl: dict,
     edit_dir: Path,
     out_path: Path,
     profanity_matcher: re.Pattern | None = None,
+    style: str = "bold-overlay",
+    text_fixes: list[tuple[str, str]] | None = None,
 ) -> None:
     """Build an output-timeline SRT from per-source transcripts.
 
-    - phrase-aware ~2-word chunks (see chunk_words)
-    - UPPERCASE text
-    - Output times computed as word.start - segment_start + segment_offset
-    - If `profanity_matcher` is given, each matched word is replaced with
-      literal "***" before joining — see helpers/profanity.py. This is the
-      caption side of --censor-profanity; find_censor_ranges() below is the
-      audio side, computed independently so audio stays censored even when
-      the EDL points at a hand-written subtitles file instead of this one.
+    style="bold-overlay" (default): phrase-aware ~2-word chunks (chunk_words),
+      UPPERCASE — built to be burned into frame via --build-subtitles.
+    style="natural": reading-length cues (chunk_words_natural), sentence
+      case only at sentence starts, cues stretched toward a 1s minimum
+      without overlapping the next one — built to ship as a plain sidecar
+      .srt (pair with --srt-only) for a native player's own caption renderer.
+
+    Output times computed as word.start - segment_start + segment_offset.
+    If `profanity_matcher` is given, each matched word is replaced with
+    literal "***" before joining — see helpers/profanity.py. This is the
+    caption side of --censor-profanity; find_censor_ranges() below is the
+    audio side, computed independently so audio stays censored even when
+    the EDL points at a hand-written subtitles file instead of this one.
+    `text_fixes` (see load_text_fixes) are applied after profanity censoring,
+    before casing — regex substitutions in cue text, e.g. ASR corrections.
     """
     transcripts_dir = edit_dir / "transcripts"
     sources = edl["sources"]
+    fixes = text_fixes or []
+    natural = style == "natural"
 
     entries: list[tuple[float, float, str]] = []
     seg_offset = 0.0
@@ -655,8 +966,9 @@ def build_master_srt(
 
         transcript = json.loads(tr_path.read_text())
         words_in_seg = _words_in_range(transcript, seg_start, seg_end)
+        chunks = chunk_words_natural(words_in_seg) if natural else chunk_words(words_in_seg)
 
-        for chunk in chunk_words(words_in_seg):
+        for chunk in chunks:
             local_start = max(seg_start, chunk[0].get("start", seg_start))
             local_end = min(seg_end, chunk[-1].get("end", seg_end))
             out_start = max(0.0, local_start - seg_start) + seg_offset
@@ -668,23 +980,49 @@ def build_master_srt(
                 words_text = [censor_word(t, profanity_matcher) for t in words_text]
             text = " ".join(words_text)
             text = re.sub(r"\s+", " ", text).strip()
-            # Strip trailing punctuation for cleaner uppercase look
-            text = text.rstrip(",;:")
-            text = text.upper()
             entries.append((out_start, out_end, text))
 
         seg_offset += seg_duration
 
-    # Sort and write as SRT
     entries.sort(key=lambda e: e[0])
+
+    if natural:
+        # Stretch short cues toward NATURAL_MIN_CUE_S for readability, but
+        # never past the start of the next cue (no overlaps) and never past
+        # a small fixed step beyond the cue's own last word.
+        for i in range(len(entries)):
+            a, b, t = entries[i]
+            next_start = entries[i + 1][0] if i + 1 < len(entries) else b + 1.0
+            if b - a < NATURAL_MIN_CUE_S:
+                b = min(max(b, a + NATURAL_MIN_CUE_S), next_start - 0.02, b + 0.5)
+            else:
+                b = min(b, next_start - 0.02)
+            entries[i] = (a, max(b, a + 0.3), t)
+
+        # Sentence case: capitalize only right after a sentence actually
+        # ended (previous cue's text ended in . ? !), not every cue.
+        prev_ended_sentence = True
+        for i, (a, b, t) in enumerate(entries):
+            t = _apply_text_fixes(t, fixes)
+            t = t.rstrip(",;: ")
+            if prev_ended_sentence and t:
+                t = t[0].upper() + t[1:]
+            prev_ended_sentence = t[-1:] in ".?!"
+            entries[i] = (a, b, t)
+    else:
+        for i, (a, b, t) in enumerate(entries):
+            t = _apply_text_fixes(t, fixes)
+            t = t.rstrip(",;:").upper()  # bold-overlay: strip trailing punctuation, UPPERCASE
+            entries[i] = (a, b, t)
+
     lines: list[str] = []
     for i, (a, b, t) in enumerate(entries, start=1):
         lines.append(str(i))
         lines.append(f"{_srt_timestamp(a)} --> {_srt_timestamp(b)}")
         lines.append(t)
         lines.append("")
-    out_path.write_text("\n".join(lines))
-    print(f"master SRT → {out_path.name} ({len(entries)} cues)")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"master SRT ({style}) -> {out_path.name} ({len(entries)} cues)")
 
 
 # -------- Profanity audio censoring (--censor-profanity) --------------------
@@ -830,8 +1168,12 @@ def apply_loudnorm_two_pass(
             "-movflags", "+faststart",
             str(output_path),
         ]
-        print(f"  loudnorm (1-pass preview) → {output_path.name}")
+        print(f"  loudnorm (1-pass preview) -> {output_path.name}")
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # No true-peak re-verify here, deliberately — preview trades accuracy
+        # for speed everywhere else too; the guarantee is for --preview's
+        # absence (the final render), which calls verify_and_limit_true_peak
+        # below after its own two-pass loudnorm.
         return True
 
     # Full two-pass
@@ -862,9 +1204,58 @@ def apply_loudnorm_two_pass(
         "-movflags", "+faststart",
         str(output_path),
     ]
-    print(f"  loudnorm pass 2: normalizing → {output_path.name}")
+    print(f"  loudnorm pass 2: normalizing -> {output_path.name}")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    verify_and_limit_true_peak(output_path)
     return True
+
+
+def measure_true_peak(path: Path) -> float | None:
+    """Actual true peak of a rendered file, in dBTP, via ebur128 — independent
+    of whatever loudnorm itself reported, which is a measurement of its INPUT
+    and its own internal gain model, not a guarantee about its output."""
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        "-i", str(path), "-af", "ebur128=peak=true", "-f", "null", "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # ebur128's summary prints "True peak:\n    Peak:  X.X dBFS" near the end
+    # of stderr; grabbing every "Peak:" match and taking the last one is more
+    # robust to exact spacing/formatting than anchoring on the section label.
+    matches = re.findall(r"Peak:\s*([-\d.]+)\s*dBFS", proc.stderr)
+    return float(matches[-1]) if matches else None
+
+
+def verify_and_limit_true_peak(path: Path) -> None:
+    """Loudnorm's own linear-mode gain can still overshoot the true-peak
+    target on real content — measured on a real render: loudnorm reported
+    success at I=-14 LUFS, TP=-1 dBTP, but the actual output measured 0.0
+    dBFS true peak. Re-measure the real output and, if it's over target,
+    apply a brickwall limiter in place rather than trust the filter's own
+    claim. 192kHz oversampling before the limiter is what makes ffmpeg's
+    "true" (inter-sample) peak detection meaningful — limiting at the
+    original sample rate only catches peaks that land exactly on a sample.
+    """
+    tp = measure_true_peak(path)
+    if tp is None or tp <= LOUDNORM_TP:
+        return
+    print(f"  true peak {tp:.1f} dBTP exceeds target {LOUDNORM_TP} dBTP — applying a limiter")
+    tmp = path.with_suffix(".prelimit.mp4")
+    path.rename(tmp)
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-nostats",
+        "-i", str(tmp),
+        "-c:v", "copy",
+        "-af", "aresample=192000,alimiter=limit=0.8:level=false,aresample=48000",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        str(path),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    tmp.unlink(missing_ok=True)
+    tp_after = measure_true_peak(path)
+    if tp_after is not None:
+        print(f"    re-measured: {tp_after:.1f} dBTP")
 
 
 # -------- Final compositing (Rule 1 + Rule 4) -------------------------------
@@ -1003,7 +1394,7 @@ def build_final_composite(
         "-movflags", "+faststart",
         str(out_path),
     ]
-    print(f"compositing → {out_path.name}")
+    print(f"compositing -> {out_path.name}")
     print(f"  overlays: {len(overlays)}, subtitles: {'yes' if has_subs else 'no'}"
           + (f", censored: {len(censor_ranges)} word(s) ({censor_mode})" if has_censor else ""))
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -1015,11 +1406,13 @@ def build_final_composite(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Render a video from an EDL")
     ap.add_argument("edl", type=Path, help="Path to edl.json")
-    ap.add_argument("-o", "--output", type=Path, required=True, help="Output video path")
+    ap.add_argument("-o", "--output", type=Path, default=None,
+                    help="Output video path. Required unless --list-resolutions.")
     ap.add_argument(
         "--preview",
         action="store_true",
-        help="Preview mode: 1080p, medium, CRF 22 — evaluable for QC, faster than final.",
+        help="Preview mode: medium preset, CRF 22, same resolution the final "
+             "will ship at — evaluable for QC, faster than final.",
     )
     ap.add_argument(
         "--draft",
@@ -1077,10 +1470,66 @@ def main() -> None:
         action="store_true",
         help="Silence profanity instead of bleeping it. Only with --censor-profanity.",
     )
+    ap.add_argument(
+        "--res",
+        type=int,
+        choices=(1080, 2160),
+        default=None,
+        help="Force output resolution: 1080 or 2160 (UHD), overriding the "
+             "default of the source's own max native resolution. "
+             "Overridden by --width if both are given.",
+    )
+    ap.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Exact output width in pixels (height follows the source aspect "
+             "ratio), overriding the default of the source's own max native "
+             "resolution. Overrides --res.",
+    )
+    ap.add_argument(
+        "--list-resolutions",
+        action="store_true",
+        help="Print each EDL source's native resolution and the long edge "
+             "render.py would default to, then exit without rendering. For "
+             "presenting the resolution choice to the user before committing "
+             "to a render.",
+    )
+    ap.add_argument(
+        "--srt-only",
+        action="store_true",
+        help="Write master.srt but don't burn it into the video. Implies "
+             "--build-subtitles; use with --subtitle-style natural for a "
+             "sidecar meant to be read in a native player, not burned.",
+    )
+    ap.add_argument(
+        "--subtitle-style",
+        choices=("bold-overlay", "natural"),
+        default="bold-overlay",
+        help="bold-overlay (default): ~2-word UPPERCASE chunks, built to be "
+             "burned into frame. natural: sentence-case reading-length cues "
+             "(<=42 chars/<=8 words, break on pause, 1s minimum, no overlap) "
+             "— meant for --srt-only, reads badly burned in.",
+    )
+    ap.add_argument(
+        "--text-fixes",
+        type=Path,
+        default=None,
+        help="Caption text corrections: a file of 'pattern<TAB>replacement' "
+             "regex lines (# comments ok), applied to every cue. For "
+             "consistent ASR mishears of a proper noun/term specific to this "
+             "project — see helpers/render.py's load_text_fixes.",
+    )
     args = ap.parse_args()
 
+    if not args.list_resolutions and args.output is None:
+        ap.error("-o/--output is required unless --list-resolutions")
     if args.censor_mute and not args.censor_profanity:
         ap.error("--censor-mute requires --censor-profanity")
+    if args.width is not None and args.width <= 0:
+        ap.error("--width must be a positive number of pixels")
+    build_subtitles = args.build_subtitles or args.srt_only
+    text_fixes = load_text_fixes(args.text_fixes)
 
     edl_path = args.edl.resolve()
     if not edl_path.exists():
@@ -1088,11 +1537,52 @@ def main() -> None:
 
     edl = json.loads(edl_path.read_text())
     edit_dir = edl_path.parent
+
+    if args.list_resolutions:
+        max_edge, per_source_res = probe_max_resolution(edl, edit_dir)
+        if not per_source_res:
+            sys.exit("no probeable sources in this EDL's ranges")
+        print("source resolutions (long edge, rotation-aware):")
+        for name, edge in sorted(per_source_res.items(), key=lambda kv: -kv[1]):
+            marker = "  <- max, render.py's default" if edge == max_edge else ""
+            print(f"  {name:20} {edge}px{marker}")
+        print(f"\nOther common choices: --res 1080 (1920px), --res 2160 (3840px, UHD), "
+              f"or --width N for anything else.")
+        return
+
     out_path = args.output.resolve()
 
+    # 0. Clamp every range to its own source's duration, in place, before
+    # anything below reads edl["ranges"] — a range that runs past the end of
+    # its source silently shorts that segment (the whole clip, for a short
+    # title/end card), not just trims a few frames off the tail.
+    clamped = clamp_edl_ranges(edl, edit_dir)
+    if clamped:
+        print(f"clamped {clamped} range(s) to their source's duration (see warnings above)")
+
+    # 0b. Resolution: --width or --res, if given, are explicit and win
+    # outright. Otherwise default to the ACTUAL max native resolution across
+    # the EDL's sources, probed just now, not a hardcoded 1080p — this was a
+    # silent, fixed downscale of 4K source (or upscale of anything smaller)
+    # regardless of what the footage actually was. An agent-driven session
+    # should still surface the detected per-source resolutions (--list-
+    # resolutions) and ask which one the user wants (see SKILL.md "Output
+    # spec") rather than relying on this default alone — this is the
+    # computation behind that choice, not a replacement for asking.
+    if args.width:
+        width = args.width
+    elif args.res:
+        width = 3840 if args.res == 2160 else DEFAULT_WIDTH
+    else:
+        width, per_source_res = probe_max_resolution(edl, edit_dir)
+        if per_source_res:
+            detail = ", ".join(f"{name}={edge}px" for name, edge in sorted(per_source_res.items()))
+            print(f"resolution: {width}px long edge (max across sources: {detail})")
+
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
-    segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft, fps=args.fps, lut=args.lut
+    segment_paths, resolved_rate = extract_all_segments(
+        edl, edit_dir, preview=args.preview, draft=args.draft, fps=args.fps,
+        lut=args.lut, width=width,
     )
 
     # 2. Concat → base
@@ -1104,6 +1594,27 @@ def main() -> None:
         base_name = "base.mp4"
     base_path = edit_dir / base_name
     concat_segments(segment_paths, base_path, edit_dir)
+
+    # 2a. Verify nothing silently came up short. extract_segment is
+    # frame-quantized and clamp_edl_ranges already keeps every range inside
+    # its source, so this should always pass — it exists as a loud, named
+    # failure instead of a visually-missing section discovered by eye days
+    # later (the actual way this was found: a title card and an end card
+    # both silently rendered short/empty on a real project).
+    expected_duration = sum(float(r["end"]) - float(r["start"]) for r in edl["ranges"])
+    actual_duration = probe_duration(base_path)
+    if actual_duration is not None:
+        drift = abs(actual_duration - expected_duration)
+        # One frame of tolerance at the rate segments were actually encoded
+        # at (returned by extract_all_segments above), not a guessed constant.
+        frame_s = 1 / float(Fraction(resolved_rate))
+        if drift > max(frame_s, 0.05):
+            sys.exit(
+                f"render verification failed: base.mp4 is {actual_duration:.3f}s but "
+                f"the EDL's ranges sum to {expected_duration:.3f}s (drift {drift:.3f}s). "
+                f"A segment likely rendered short or a range was silently dropped — "
+                f"check the per-segment log above rather than shipping this render."
+            )
 
     # 2b. Profanity: resolve the matcher once, find every flagged word's
     # output-timeline position. Independent of subtitle building, so audio
@@ -1122,14 +1633,21 @@ def main() -> None:
             print(f"profanity filter: {len(censor_ranges)} word(s) flagged"
                   + (f" — {', '.join(flagged)}" if flagged else ""))
 
-    # 3. Subtitles: build if requested, resolve final path
-    subs_path: Path | None = None
+    # 3. Subtitles: build if requested, resolve final path.
+    # --srt-only writes the sidecar but never sets burn_path, so step 4 below
+    # never burns it — the file exists at edit_dir/master.srt either way.
+    burn_path: Path | None = None
     if not args.no_subtitles:
-        if args.build_subtitles:
+        if build_subtitles:
             subs_path = edit_dir / "master.srt"
-            build_master_srt(edl, edit_dir, subs_path, profanity_matcher=profanity_matcher)
+            build_master_srt(
+                edl, edit_dir, subs_path, profanity_matcher=profanity_matcher,
+                style=args.subtitle_style, text_fixes=text_fixes,
+            )
+            if not args.srt_only:
+                burn_path = subs_path
         elif edl.get("subtitles"):
-            subs_path = resolve_subtitles_path(edl["subtitles"], edit_dir)
+            burn_path = resolve_subtitles_path(edl["subtitles"], edit_dir)
             if args.censor_profanity:
                 print("  note: EDL-provided subtitles are not generated here, so "
                       "--censor-profanity cannot redact them — only the audio "
@@ -1140,14 +1658,14 @@ def main() -> None:
     censor_mode = "mute" if args.censor_mute else "bleep"
     if args.no_loudnorm:
         # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir,
+        build_final_composite(base_path, overlays, burn_path, out_path, edit_dir,
                                censor_ranges=censor_ranges, censor_mode=censor_mode)
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir,
+        build_final_composite(base_path, overlays, burn_path, tmp_composite, edit_dir,
                                censor_ranges=censor_ranges, censor_mode=censor_mode)
-        print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
+        print("loudness normalization -> social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)
 

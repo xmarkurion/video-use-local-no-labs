@@ -31,6 +31,19 @@ import argparse
 import json
 import subprocess
 import sys
+
+# Windows' legacy console codepage (cp1252) can't encode some characters that
+# show up in these prints (an em dash is fine; a unicode arrow like U+2192
+# raised UnicodeEncodeError and crashed the run after the real work was
+# already done and the output file already written). Force UTF-8 stdout/
+# stderr so prose text never crashes a run regardless of what a future edit
+# adds. Wrapped in try/except: reconfigure can itself fail against some
+# redirected/piped streams, and a cosmetic safety net must never be fatal.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import tempfile
 from pathlib import Path
 
@@ -265,8 +278,8 @@ def auto_grade_for_clip(
     if verbose:
         print(f"  auto-grade stats:")
         print(f"    y_mean={y_mean:.3f}  y_range={y_range:.3f}  sat_mean={sat_mean:.3f}")
-        print(f"    → contrast={contrast_adj:.3f}  gamma={gamma_adj:.3f}  sat={sat_adj:.3f}")
-        print(f"    → filter: {filter_string or '(empty)'}")
+        print(f"    -> contrast={contrast_adj:.3f}  gamma={gamma_adj:.3f}  sat={sat_adj:.3f}")
+        print(f"    -> filter: {filter_string or '(empty)'}")
 
     return filter_string, stats
 
@@ -361,7 +374,7 @@ def main() -> None:
         # Auto mode (default)
         filter_string, _ = auto_grade_for_clip(args.input, verbose=True)
 
-    print(f"grading {args.input.name} → {args.output.name}")
+    print(f"grading {args.input.name} -> {args.output.name}")
     if filter_string:
         print(f"  filter: {filter_string[:120]}{'...' if len(filter_string) > 120 else ''}")
     else:

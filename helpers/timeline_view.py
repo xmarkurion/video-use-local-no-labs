@@ -24,6 +24,19 @@ import argparse
 import json
 import subprocess
 import sys
+
+# Windows' legacy console codepage (cp1252) can't encode some characters that
+# show up in these prints (an em dash is fine; a unicode arrow like U+2192
+# raised UnicodeEncodeError and crashed the run after the real work was
+# already done and the output file already written). Force UTF-8 stdout/
+# stderr so prose text never crashes a run regardless of what a future edit
+# adds. Wrapped in try/except: reconfigure can itself fail against some
+# redirected/piped streams, and a cosmetic safety net must never be fatal.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import tempfile
 from pathlib import Path
 
@@ -157,6 +170,11 @@ FONT_CANDIDATES = [
     "/System/Library/Fonts/SFNSMono.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    # Windows — none of the above exist there, so without these every overlay
+    # on Windows silently fell through to the final fallback below.
+    r"C:\Windows\Fonts\consola.ttf",   # Consolas — monospace, matches the Menlo intent
+    r"C:\Windows\Fonts\arial.ttf",
+    r"C:\Windows\Fonts\segoeui.ttf",
 ]
 
 
@@ -167,7 +185,16 @@ def load_font(size: int) -> ImageFont.ImageFont:
                 return ImageFont.truetype(fp, size)
             except Exception:
                 continue
-    return ImageFont.load_default()
+    # Found no system font at all (unusual, but possible in a minimal
+    # container). Pillow >= 10.1's load_default() takes a size and renders
+    # from a bundled TTF — without passing `size` here it silently returns a
+    # font fixed at 10px regardless of what was asked for, which is how this
+    # was actually found (every PIL overlay on a Windows box with none of the
+    # paths above stuck at 10px no matter the requested size).
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()  # Pillow < 10.1: no size param at all
 
 
 # -------- Composite ----------------------------------------------------------
@@ -227,7 +254,7 @@ def render_timeline(
         # Header — time range
         draw.text(
             (50, 12),
-            f"{video.name}   {start:.2f}s → {end:.2f}s   ({(end - start):.2f}s, {n_frames} frames)",
+            f"{video.name}   {start:.2f}s -> {end:.2f}s   ({(end - start):.2f}s, {n_frames} frames)",
             fill=FG,
             font=header_font,
         )

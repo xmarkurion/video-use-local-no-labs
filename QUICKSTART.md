@@ -119,6 +119,39 @@ python helpers/transcribe_batch.py "$VIDEOS" --diarize --num-speakers 2
 # for exactly what does and doesn't survive the handoff (grade/LUT and
 # captions do not — they're noted in the XML / left as a sidecar .srt).
 python helpers/export_timeline.py edl.json -o edit/timeline.xml
+
+# Different LUTs on different sources in the SAME render (camera footage vs.
+# a screen recording, say) — a range's own "lut" field or an EDL-level
+# "luts": {"source_name": "lut_name"} map overrides the global --lut per clip.
+
+# Resolution defaults to the highest native resolution among your sources —
+# see what that is before rendering, no need to guess:
+python helpers/render.py edl.json --list-resolutions
+
+# Force a specific resolution instead of the auto-detected default
+python helpers/render.py edl.json -o final_1080p.mp4 --res 1080
+python helpers/render.py edl.json -o final_4k.mp4 --res 2160
+
+# Readable sidecar captions (sentence case, not burned) instead of the
+# bold-overlay burn-in default — for a video meant to be watched with a
+# native player's own caption toggle
+python helpers/render.py edl.json -o final.mp4 \
+  --srt-only --subtitle-style natural
+
+# ASR keeps mishearing a specific proper noun/term consistently — fix it
+# project-wide instead of patching every cue by hand:
+printf 'BlueTuck\tBlu Tack\n' > edit/text_fixes.txt
+python helpers/render.py edl.json -o final.mp4 --build-subtitles \
+  --text-fixes edit/text_fixes.txt
+
+# 3 thumbnail candidates (auto-picked for visual interest), same title
+# treatment on all 3 so the comparison is "which frame", not "text or not"
+python helpers/thumbnail.py edit/final.mp4 --title "LAUNCH VIDEO"
+
+# 3 portrait Shorts/Reels/TikTok clips from a finished render — no EDL or
+# prior transcript needed, auto-picks moments, snaps to word boundaries,
+# captions on by default
+python helpers/shorts.py edit/final.mp4
 ```
 
 (`--diarize` needs a free HuggingFace token in `.env` the first time — `install.md` covers getting one; every other command above needs nothing.)
@@ -137,6 +170,12 @@ python helpers/export_timeline.py edl.json -o edit/timeline.xml
 | `render.py <edl> -o <out> --lut <name>` | + apply a `.cube` from `lut/` |
 | `render.py <edl> -o <out> --censor-profanity` | + bleep/`***` flagged words |
 | `render.py <edl> -o <out> --censor-profanity --censor-mute` | …silence instead of a bleep |
+| `render.py <edl> --list-resolutions` | See every source's native resolution before rendering |
+| `render.py <edl> -o <out>` | Renders at the source's own max resolution by default (`--res 1080\|2160` / `--width N` to force) |
+| `render.py <edl> -o <out> --srt-only --subtitle-style natural` | Readable sidecar captions, not burned |
+| `render.py <edl> -o <out> --text-fixes <file>` | Apply project-specific ASR corrections to captions |
+| `thumbnail.py <video> --title "TEXT"` | 3 auto-picked thumbnail candidates |
+| `shorts.py <video>` | 3 portrait Shorts/Reels/TikTok clips from a finished render |
 | `grade.py --list-presets` | See the built-in color grade presets |
 | `export_timeline.py <edl> -o <out.xml>` | Editable timeline for DaVinci Resolve / Premiere Pro, instead of a flattened render |
 

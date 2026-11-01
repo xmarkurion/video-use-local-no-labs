@@ -151,13 +151,19 @@ class BuildTimelineFrameMathTests(unittest.TestCase):
         self.assertEqual(second_a_file.get("id"), first_a_file.get("id"))
         self.assertEqual(len(list(second_a_file)), 0)
 
-    def test_in_out_use_source_rate_start_end_use_sequence_rate(self):
-        # Two sources at different native rates; sequence rate forced to 24.
+    def test_in_out_use_the_clipitems_own_rate_not_the_sources(self):
+        # Regression for the CRITICAL bug: in/out were computed at the
+        # SOURCE's own native fps while the clipitem's <rate> is the
+        # SEQUENCE rate. Premiere/Resolve read in/out through the clipitem's
+        # <rate> — there is no separate "read at the file's own rate" mode —
+        # so a 24fps source cut at 1.0-2.0s, written at 24fps as frames 24-48,
+        # gets interpreted on a 30fps sequence as 0.8-1.6s: wrong position,
+        # and on a real mixed-rate project (47.952fps camera footage) the
+        # error was large enough to land past the end of the file entirely —
+        # Premiere showed it as hatched "media offline".
         def fake_run(cmd, **kwargs):
-            # cmd is an argv list; the probed path is one element of it, not
-            # the whole list — membership needs a substring check per element.
             if any("A.mp4" in str(arg) for arg in cmd):
-                return _ffprobe_rate_result("24/1")
+                return _ffprobe_rate_result("24/1")  # source's own rate
             return _ffprobe_rate_result("60/1")
 
         edl = self._edl(
@@ -167,19 +173,31 @@ class BuildTimelineFrameMathTests(unittest.TestCase):
             edit_dir = Path(d)
             (edit_dir / "A.mp4").write_bytes(b"\x00")
             with (
+                # fake_run only understands the fps-probe JSON shape; a
+                # format=duration probe (from clamp_edl_ranges) gets that same
+                # JSON text handed to float() by probe_duration, which raises,
+                # is caught, and returns None — clamping no-ops safely, which
+                # is fine here since this test isn't exercising clamping.
                 patch.object(export_timeline.subprocess, "run", side_effect=lambda cmd, **kw: fake_run(cmd, **kw)),
                 patch.object(export_timeline, "probe_dimensions", return_value=(1920, 1080)),
             ):
-                root, _ = export_timeline.build_timeline(edl, edit_dir, fps="30")
+                root, _ = export_timeline.build_timeline(edl, edit_dir, fps="30")  # sequence rate != source rate
         clip = root.find("./sequence/media/video/track/clipitem")
-        # in/out: where in the SOURCE file this range sits — source's own rate.
-        self.assertEqual(clip.find("in").text, "24")   # 1.0s * 24fps
-        self.assertEqual(clip.find("out").text, "48")  # 2.0s * 24fps
-        # start/end: where on the OUTPUT TIMELINE this clip sits — sequence
-        # rate, and since this is the only (first) range, that's 0 -> duration,
-        # not a rate-converted copy of the source's own 1.0-2.0 window.
-        self.assertEqual(clip.find("start").text, "0")   # output position 0
-        self.assertEqual(clip.find("end").text, "30")    # + 1.0s duration * 30fps
+        # The clipitem's own declared rate is the sequence rate (30), not 24.
+        self.assertEqual(clip.find("rate/timebase").text, "30")
+        # start/end: output-timeline position. Only range, so 0 -> duration.
+        self.assertEqual(clip.find("start").text, "0")    # output position 0
+        self.assertEqual(clip.find("end").text, "30")     # + 1.0s * 30fps
+        # in/out: at the SAME (sequence) rate as <rate> above, NOT 24fps.
+        # 1.0s source position at 30fps = frame 30, not 24.
+        self.assertEqual(clip.find("in").text, "30")
+        self.assertEqual(clip.find("out").text, "60")     # 30 + (end-start)=30
+        # The one invariant that must always hold, by construction: a
+        # clipitem's displayed duration (end-start) must equal its source
+        # duration (out-in), or the two numbers the app reads disagree.
+        start, end = int(clip.find("start").text), int(clip.find("end").text)
+        in_, out = int(clip.find("in").text), int(clip.find("out").text)
+        self.assertEqual(out - in_, end - start)
 
     def test_audio_track_mirrors_video_positions_without_duplicate_file_defs(self):
         edl = self._edl([{"source": "A", "start": 0.0, "end": 1.0}])
@@ -256,6 +274,104 @@ class BuildTimelineNotesTests(unittest.TestCase):
         edl = {"sources": {"A": "A.mp4"}, "ranges": [{"source": "A", "start": 0.0, "end": 1.0}]}
         root, notes = self._run(edl)
         self.assertIsNone(root.find("./sequence/comments"))
+
+
+class AcceptanceCheckMixedRateTests(unittest.TestCase):
+    """The formal acceptance checks from the bug report, built against the
+    exact scenario that found the bugs: a 47.952fps (DJI; exact fraction
+    48000/1001) 4K source cut next to a 30fps (OBS) 1080p source, on a
+    23.976fps (24000/1001) timeline — plus a deliberately out-of-bounds
+    range to prove the source-duration clamp actually fires.
+
+    For every clipitem:
+      - out * seq_frame_duration <= source duration (never reads past the file)
+      - out - in == end - start                     (no silent duration mismatch)
+    And across the whole V1 track: clips are contiguous (no gaps/overlaps).
+    """
+
+    DJI_RATE = "48000/1001"   # 47.952fps, the exact-fraction form real NLEs use
+    OBS_RATE = "30/1"
+    SEQ_RATE = "24000/1001"   # 23.976fps
+    DJI_DURATION_S = 300.0
+    OBS_DURATION_S = 600.0
+
+    def _fake_run(self, cmd, **kwargs):
+        path_arg = next((str(a) for a in cmd if "DJI" in str(a) or "OBS" in str(a)), "")
+        is_dji = "DJI" in path_arg
+        joined = " ".join(str(a) for a in cmd)
+        if "format=duration" in joined:
+            dur = self.DJI_DURATION_S if is_dji else self.OBS_DURATION_S
+            return subprocess.CompletedProcess([], 0, stdout=f"{dur}\n", stderr="")
+        if "width,height" in joined:
+            return _ffprobe_stream_result(3840, 2160) if is_dji else _ffprobe_stream_result(1920, 1080)
+        # fps probe
+        return _ffprobe_rate_result(self.DJI_RATE if is_dji else self.OBS_RATE)
+
+    def _build(self, ranges, sources=None):
+        sources = sources or {
+            "DJI_0012": "DJI_0012.MP4",
+            "OBS_screen": "OBS_screen.mp4",
+        }
+        edl = {"sources": sources, "ranges": ranges}
+        with tempfile.TemporaryDirectory() as d:
+            edit_dir = Path(d)
+            for name in sources.values():
+                (edit_dir / name).write_bytes(b"\x00")
+            with patch.object(export_timeline.subprocess, "run", side_effect=self._fake_run):
+                return export_timeline.build_timeline(edl, edit_dir, fps=self.SEQ_RATE)
+
+    def test_fifty_cut_mixed_rate_edl_satisfies_every_invariant(self):
+        # 50 alternating cuts, well inside each source's duration.
+        ranges = []
+        t = 0.0
+        for i in range(50):
+            src = "DJI_0012" if i % 2 == 0 else "OBS_screen"
+            dur = 2.0 + (i % 3) * 0.37  # irregular durations, not a round-number coincidence
+            ranges.append({"source": src, "start": t, "end": t + dur, "beat": f"cut{i}"})
+            t += dur * 1.7  # non-contiguous SOURCE positions (normal for real cuts)
+
+        root, notes = self._build(ranges)
+        self.assertEqual(notes["clamped_ranges"], 0)  # nothing here should need clamping
+
+        seq_frame_dur = 1001 / 24000  # seconds per frame at the sequence rate
+        clips = root.findall("./sequence/media/video/track/clipitem")
+        self.assertEqual(len(clips), 50)
+
+        durations = {"file-DJI_0012": self.DJI_DURATION_S, "file-OBS_screen": self.OBS_DURATION_S}
+
+        prev_end = 0
+        for clip in clips:
+            start = int(clip.find("start").text)
+            end = int(clip.find("end").text)
+            in_ = int(clip.find("in").text)
+            out = int(clip.find("out").text)
+            # file id is always present, even on a bare self-closing reference
+            # (later occurrences of a source don't repeat <name>/duration) —
+            # use it to find the right source duration for EVERY clip, not
+            # just the one that happens to carry the full <file> definition.
+            src_duration = durations[clip.find("file").get("id")]
+
+            # out - in == end - start, always (the core bug #1 invariant).
+            self.assertEqual(out - in_, end - start, ET.tostring(clip, encoding="unicode"))
+
+            # out * seq_frame_duration <= source duration (never past the file).
+            self.assertLessEqual(out * seq_frame_dur, src_duration + 1e-6)
+
+            # Contiguous: this clip's start == the previous clip's end.
+            self.assertEqual(start, prev_end)
+            prev_end = end
+
+    def test_range_exceeding_source_duration_is_clamped_before_export(self):
+        # DJI source is 300s; ask for a range ending 0.5s past that (the
+        # word-snap-padding + frame-rounding scenario that actually happened).
+        ranges = [{"source": "DJI_0012", "start": 298.0, "end": 300.5, "beat": "near end"}]
+        root, notes = self._build(ranges)
+        self.assertEqual(notes["clamped_ranges"], 1)
+
+        seq_frame_dur = 1001 / 24000
+        clip = root.find("./sequence/media/video/track/clipitem")
+        out = int(clip.find("out").text)
+        self.assertLessEqual(out * seq_frame_dur, self.DJI_DURATION_S + 1e-6)
 
 
 class BuildTimelineOverlayPathTests(unittest.TestCase):

@@ -20,6 +20,8 @@ Cloud-hosted video-use is coming. [Join the waitlist at video-use.com](https://v
 - **Burns subtitles** in your style — 2-word UPPERCASE chunks by default, fully customizable
 - **Censors profanity** on request — `***` in captions, a bleep (or silence) in the audio, at the exact word
 - **Exports an editable timeline** to DaVinci Resolve or Premiere Pro, instead of (or alongside) a flattened render
+- **Generates thumbnail candidates and a title/description**, once a render is confirmed
+- **Turns a finished render into 3 portrait Shorts/Reels/TikTok clips** — auto-picked, word-boundary-snapped, captioned
 - **Generates animation overlays** via [HyperFrames](https://github.com/heygen-com/hyperframes), [Remotion](https://www.remotion.dev/), [Manim](https://www.manim.community/), or PIL — spawned in parallel sub-agents, one per animation
 - **Self-evaluates the rendered output** at every cut boundary before showing you anything
 - **Persists session memory** in `project.md` so next week's session picks up where you left off

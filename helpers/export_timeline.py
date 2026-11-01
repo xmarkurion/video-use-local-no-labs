@@ -50,12 +50,26 @@ import argparse
 import json
 import subprocess
 import sys
+
+# Windows' legacy console codepage (cp1252) can't encode some characters that
+# show up in these prints (an em dash is fine; a unicode arrow like U+2192
+# raised UnicodeEncodeError and crashed the run after the real work was
+# already done and the output file already written). Force UTF-8 stdout/
+# stderr so prose text never crashes a run regardless of what a future edit
+# adds. Wrapped in try/except: reconfigure can itself fail against some
+# redirected/piped streams, and a cosmetic safety net must never be fatal.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import xml.etree.ElementTree as ET
 from fractions import Fraction
 from pathlib import Path
 from urllib.parse import quote
 
 from render import (  # same directory
+    clamp_edl_ranges,
     parse_fps,
     probe_source_fps,
     resolve_edl_asset_path,
@@ -199,11 +213,19 @@ def build_timeline(
     """Returns (the <xmeml> root element, a notes dict for the caller to print).
 
     notes = {"grade": str|None, "lut": str|None, "lut_path": Path|None,
-             "subtitles": str|None, "sources_missing_media": list[str]}
+             "subtitles": str|None, "sources_missing_media": list[str],
+             "clamped_ranges": int}
     """
+    # Clamp first, in place — before anything below reads edl["ranges"] — so
+    # every clipitem this function emits agrees with what render.py would
+    # actually produce from the same (now-clamped) EDL. Idempotent: a caller
+    # that already clamped upstream just gets 0 back here.
+    clamped_count = clamp_edl_ranges(edl, edit_dir)
+
     sources = edl["sources"]
     ranges = edl["ranges"]
     overlays = edl.get("overlays") or []
+    per_source_luts: dict = edl.get("luts") or {}
 
     # Same frame-rate resolution policy as render.py's extract_all_segments,
     # imported rather than reimplemented so the XML's timeline rate can never
@@ -229,6 +251,7 @@ def build_timeline(
         "lut_path": None,
         "subtitles": edl.get("subtitles"),
         "sources_missing_media": [],
+        "clamped_ranges": clamped_count,
     }
     if notes["lut"]:
         try:
@@ -294,17 +317,32 @@ def build_timeline(
 
         timeline_start = seconds_to_frames(seg_offset_s, seq_rate)
         timeline_end = seconds_to_frames(seg_offset_s + seg_duration_s, seq_rate)
-        # Source in/out use the SOURCE's own native rate — correct per-source
-        # timing even when one clip is 24fps and another is 60fps, which the
-        # single sequence rate above cannot represent on its own.
-        src_in = seconds_to_frames(seg_start_s, src_rate)
-        src_out = seconds_to_frames(seg_end_s, src_rate)
-        # A whole-file duration estimate wide enough to contain this range;
-        # xmeml wants *some* value here and real NLEs re-probe the media
-        # themselves on import, so this only needs to not undershoot src_out.
-        # +1s of padding keeps it a strict overestimate without re-probing
-        # the actual file length.
-        file_duration = src_out + src_timebase
+        # CRITICAL: in/out must be expressed at the SEQUENCE rate, not the
+        # source's own rate — found via a real mixed-rate project (47.952fps
+        # camera + 30fps screen recording on a 23.976 timeline) where Premiere
+        # rendered every clip as hatched "media offline/beyond end" bars.
+        # A clipitem carries exactly ONE <rate> (the sequence rate, set
+        # below), and BOTH apps read in/out through that same rate — there is
+        # no separate "read in/out at the file's native rate" mode. A range
+        # cut at source-second 113 on 47.952fps footage, written here as
+        # round(113 * 47.952) = 5418, gets interpreted on import as
+        # 5418 frames / 23.976fps ~= 226s — double the real position, and
+        # typically past the end of the file. The fix: derive in/out from the
+        # SAME sequence-rate frame count as start/end, which also makes
+        # `out - in == end - start` true by construction (duration can't
+        # silently disagree between the timeline position and the source
+        # range), rather than computing it a second, independent way.
+        src_in = seconds_to_frames(seg_start_s, seq_rate)
+        src_out = src_in + (timeline_end - timeline_start)
+        # The <file> block's own duration is still in the file's NATIVE rate
+        # (src_rate, not seq_rate) — that one describes the whole source
+        # media's real length for the app's own reference, a different
+        # question from where inside it this clip's in/out point at. xmeml
+        # wants *some* value here and real NLEs re-probe the media themselves
+        # on import, so this only needs to not undershoot the clip's own out
+        # point in that native rate — +1s of padding is a strict overestimate
+        # without re-probing the actual file length.
+        file_duration = seconds_to_frames(seg_end_s, src_rate) + src_timebase
 
         clip_counter += 1
         clip_id = f"clipitem-{clip_counter}"
@@ -318,9 +356,24 @@ def build_timeline(
             _text(clipitem, "end", str(timeline_end))
             _text(clipitem, "in", str(src_in))
             _text(clipitem, "out", str(src_out))
-            note = r.get("quote") or r.get("reason")
-            if note:
-                _text(clipitem, "comments", str(note))
+            note_parts = []
+            quote_or_reason = r.get("quote") or r.get("reason")
+            if quote_or_reason:
+                note_parts.append(str(quote_or_reason))
+            # Per-clip LUT override (a range's own "lut", or a per-source
+            # "luts" map entry) differs from the sequence-wide one already
+            # noted above — surface it here too, same "not applied, load it
+            # yourself" framing, or it's silently invisible per-clip.
+            clip_lut = r.get("lut") or per_source_luts.get(src_name)
+            if clip_lut:
+                try:
+                    clip_lut_path = find_lut_file(clip_lut, edit_dir)
+                except SystemExit:
+                    clip_lut_path = None
+                hint = str(clip_lut_path) if clip_lut_path else clip_lut
+                note_parts.append(f"LUT for this clip (not applied): {hint}")
+            if note_parts:
+                _text(clipitem, "comments", " | ".join(note_parts))
             _file_block(
                 clipitem, file_ids[src_name], src_path.name, src_path,
                 src_timebase, src_ntsc, file_duration, src_w, src_h, first_use,
@@ -349,18 +402,30 @@ def build_timeline(
             ov_rate = Fraction(ov_rate_str)
             ov_timebase, ov_ntsc = rate_to_timebase(ov_rate)
             ov_w, ov_h = probe_dimensions(ov_path)
-            frames = seconds_to_frames(dur, ov_rate)
+
+            ov_start = seconds_to_frames(t0, seq_rate)
+            ov_end = seconds_to_frames(t0 + dur, seq_rate)
+            # Same fix as the main V1/A1 loop above: in/out at the SEQUENCE
+            # rate (what the clipitem's own <rate> below actually is), so
+            # out-in == end-start here too — not the overlay file's own
+            # native rate, which would misread the same way if an overlay's
+            # rate ever differs from the timeline's (an animation rendered at
+            # 30fps composited onto a 23.976 sequence, say).
+            ov_out = ov_end - ov_start
+            # The <file> block's own duration is still in the FILE's native
+            # rate — same reasoning as file_duration above.
+            file_frames = seconds_to_frames(dur, ov_rate)
 
             clipitem = ET.SubElement(v2, "clipitem", id=f"overlay-{i}")
             _text(clipitem, "name", ov_path.stem)
             _rate_block(clipitem, seq_timebase, seq_ntsc)
-            _text(clipitem, "start", str(seconds_to_frames(t0, seq_rate)))
-            _text(clipitem, "end", str(seconds_to_frames(t0 + dur, seq_rate)))
+            _text(clipitem, "start", str(ov_start))
+            _text(clipitem, "end", str(ov_end))
             _text(clipitem, "in", "0")
-            _text(clipitem, "out", str(frames))
+            _text(clipitem, "out", str(ov_out))
             _file_block(
                 clipitem, f"file-overlay-{i}", ov_path.name, ov_path,
-                ov_timebase, ov_ntsc, frames, ov_w, ov_h, True,
+                ov_timebase, ov_ntsc, file_frames, ov_w, ov_h, True,
             )
             if not ov_path.exists():
                 notes["sources_missing_media"].append(f"overlay: {ov_path.name}")
@@ -415,6 +480,9 @@ def main() -> None:
 
     print(f"timeline -> {out_path}")
     print(f"  {len(edl.get('ranges') or [])} cut(s), {len(edl.get('overlays') or [])} overlay(s)")
+    if notes["clamped_ranges"]:
+        print(f"  {notes['clamped_ranges']} range(s) clamped to their source's duration "
+              f"(end exceeded the source — see the warning above for which)")
     if notes["grade"]:
         print(f"  grade NOT applied (no NLE equivalent) — noted in the XML: {notes['grade']}")
     if notes["lut"]:

@@ -18,6 +18,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+
+# Windows' legacy console codepage (cp1252) can't encode some characters that
+# show up in these prints (an em dash is fine; a unicode arrow like U+2192
+# raised UnicodeEncodeError and crashed the run after the real work was
+# already done and the output file already written). Force UTF-8 stdout/
+# stderr so prose text never crashes a run regardless of what a future edit
+# adds. Wrapped in try/except: reconfigure can itself fail against some
+# redirected/piped streams, and a cosmetic safety net must never be fatal.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 from pathlib import Path
 
 
@@ -198,7 +211,7 @@ def main() -> None:
     total_phrases = sum(len(e[2]) for e in entries)
     total_duration = sum(e[1] for e in entries)
     kb = out_path.stat().st_size / 1024
-    print(f"packed {len(entries)} transcripts → {out_path}")
+    print(f"packed {len(entries)} transcripts -> {out_path}")
     print(f"  {total_phrases} phrases, {format_duration(total_duration)} total runtime")
     print(f"  {kb:.1f} KB")
 
